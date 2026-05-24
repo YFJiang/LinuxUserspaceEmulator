@@ -9,17 +9,23 @@
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
+#include <poll.h>
 #include <signal.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -105,9 +111,41 @@ const char* syscall_name(u64 number)
     case SYS_close:
         return "close";
 #endif
+#ifdef SYS_dup
+    case SYS_dup:
+        return "dup";
+#endif
+#ifdef SYS_dup2
+    case SYS_dup2:
+        return "dup2";
+#endif
+#ifdef SYS_dup3
+    case SYS_dup3:
+        return "dup3";
+#endif
+#ifdef SYS_pipe
+    case SYS_pipe:
+        return "pipe";
+#endif
+#ifdef SYS_pipe2
+    case SYS_pipe2:
+        return "pipe2";
+#endif
+#ifdef SYS_fcntl
+    case SYS_fcntl:
+        return "fcntl";
+#endif
 #ifdef SYS_lseek
     case SYS_lseek:
         return "lseek";
+#endif
+#ifdef SYS_stat
+    case SYS_stat:
+        return "stat";
+#endif
+#ifdef SYS_lstat
+    case SYS_lstat:
+        return "lstat";
 #endif
 #ifdef SYS_fstat
     case SYS_fstat:
@@ -169,6 +207,18 @@ const char* syscall_name(u64 number)
     case SYS_gettid:
         return "gettid";
 #endif
+#ifdef SYS_getppid
+    case SYS_getppid:
+        return "getppid";
+#endif
+#ifdef SYS_getpgid
+    case SYS_getpgid:
+        return "getpgid";
+#endif
+#ifdef SYS_getpgrp
+    case SYS_getpgrp:
+        return "getpgrp";
+#endif
 #ifdef SYS_getcwd
     case SYS_getcwd:
         return "getcwd";
@@ -177,9 +227,113 @@ const char* syscall_name(u64 number)
     case SYS_ioctl:
         return "ioctl";
 #endif
+#ifdef SYS_poll
+    case SYS_poll:
+        return "poll";
+#endif
+#ifdef SYS_ppoll
+    case SYS_ppoll:
+        return "ppoll";
+#endif
+#ifdef SYS_select
+    case SYS_select:
+        return "select";
+#endif
+#ifdef SYS_pselect6
+    case SYS_pselect6:
+        return "pselect6";
+#endif
+#ifdef SYS_epoll_create1
+    case SYS_epoll_create1:
+        return "epoll_create1";
+#endif
+#ifdef SYS_epoll_ctl
+    case SYS_epoll_ctl:
+        return "epoll_ctl";
+#endif
+#ifdef SYS_epoll_wait
+    case SYS_epoll_wait:
+        return "epoll_wait";
+#endif
+#ifdef SYS_epoll_pwait
+    case SYS_epoll_pwait:
+        return "epoll_pwait";
+#endif
+#ifdef SYS_socket
+    case SYS_socket:
+        return "socket";
+#endif
+#ifdef SYS_socketpair
+    case SYS_socketpair:
+        return "socketpair";
+#endif
+#ifdef SYS_bind
+    case SYS_bind:
+        return "bind";
+#endif
+#ifdef SYS_listen
+    case SYS_listen:
+        return "listen";
+#endif
+#ifdef SYS_accept
+    case SYS_accept:
+        return "accept";
+#endif
+#ifdef SYS_accept4
+    case SYS_accept4:
+        return "accept4";
+#endif
+#ifdef SYS_connect
+    case SYS_connect:
+        return "connect";
+#endif
+#ifdef SYS_getsockname
+    case SYS_getsockname:
+        return "getsockname";
+#endif
+#ifdef SYS_getpeername
+    case SYS_getpeername:
+        return "getpeername";
+#endif
+#ifdef SYS_setsockopt
+    case SYS_setsockopt:
+        return "setsockopt";
+#endif
+#ifdef SYS_getsockopt
+    case SYS_getsockopt:
+        return "getsockopt";
+#endif
+#ifdef SYS_sendto
+    case SYS_sendto:
+        return "sendto";
+#endif
+#ifdef SYS_recvfrom
+    case SYS_recvfrom:
+        return "recvfrom";
+#endif
+#ifdef SYS_shutdown
+    case SYS_shutdown:
+        return "shutdown";
+#endif
 #ifdef SYS_clock_gettime
     case SYS_clock_gettime:
         return "clock_gettime";
+#endif
+#ifdef SYS_clock_nanosleep
+    case SYS_clock_nanosleep:
+        return "clock_nanosleep";
+#endif
+#ifdef SYS_gettimeofday
+    case SYS_gettimeofday:
+        return "gettimeofday";
+#endif
+#ifdef SYS_nanosleep
+    case SYS_nanosleep:
+        return "nanosleep";
+#endif
+#ifdef SYS_time
+    case SYS_time:
+        return "time";
 #endif
 #ifdef SYS_getrandom
     case SYS_getrandom:
@@ -245,6 +399,26 @@ const char* syscall_name(u64 number)
     case SYS_rseq:
         return "rseq";
 #endif
+#ifdef SYS_wait4
+    case SYS_wait4:
+        return "wait4";
+#endif
+#ifdef SYS_execve
+    case SYS_execve:
+        return "execve";
+#endif
+#ifdef SYS_clone
+    case SYS_clone:
+        return "clone";
+#endif
+#ifdef SYS_fork
+    case SYS_fork:
+        return "fork";
+#endif
+#ifdef SYS_vfork
+    case SYS_vfork:
+        return "vfork";
+#endif
     default:
         return "unknown";
     }
@@ -302,12 +476,25 @@ struct GuestSigAction {
     u64 mask;
 };
 
+struct GuestPollFD {
+    i32 fd;
+    i16 events;
+    i16 revents;
+};
+
+struct GuestTimeval {
+    i64 tv_sec;
+    i64 tv_usec;
+};
+
 static_assert(sizeof(GuestTimespec) == 16);
 static_assert(sizeof(GuestIOVec) == 16);
 static_assert(sizeof(GuestStat) == 144);
 static_assert(sizeof(GuestUtsname) == 390);
 static_assert(sizeof(GuestRLimit64) == 16);
 static_assert(sizeof(GuestSigAction) == 32);
+static_assert(sizeof(GuestPollFD) == 8);
+static_assert(sizeof(GuestTimeval) == 16);
 
 GuestStat convert_stat(const struct stat& st)
 {
@@ -356,6 +543,41 @@ void copy_capped(char* destination, const char* source, size_t size)
 {
     std::strncpy(destination, source, size - 1);
     destination[size - 1] = '\0';
+}
+
+bool guest_range_is_mapped(const SoftMMU& mmu, u64 address, u64 size)
+{
+    if (size == 0)
+        return false;
+    for (u64 offset = 0; offset < size; offset += page_size) {
+        if (mmu.is_mapped(address + offset, 1))
+            return true;
+    }
+    return mmu.is_mapped(address + size - 1, 1);
+}
+
+std::vector<u8> optional_sockaddr_from_guest(const SoftMMU& mmu, u64 address, u64 length)
+{
+    if (!address || length == 0)
+        return {};
+    length = std::min<u64>(length, 4096);
+    return mmu.copy_buffer_from_guest(address, static_cast<size_t>(length));
+}
+
+void copy_sockaddr_to_guest(SoftMMU& mmu, u64 address, u64 length_address, const std::vector<u8>& buffer, socklen_t length)
+{
+    if (address && length)
+        mmu.copy_to_guest(address, buffer.data(), std::min<size_t>(buffer.size(), length));
+    if (length_address)
+        mmu.write32(length_address, length);
+}
+
+void write_guest_fds(Emulator& emulator, u64 address, const int* fds, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        emulator.mmu().write32(address + i * sizeof(i32), static_cast<u32>(fds[i]));
+        emulator.register_host_fd(fds[i]);
+    }
 }
 
 }
@@ -498,9 +720,98 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
     }
 #endif
 
+#ifdef SYS_dup
+    case SYS_dup: {
+        auto fd = ::dup(static_cast<int>(arg1));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_dup2
+    case SYS_dup2: {
+        auto fd = ::dup2(static_cast<int>(arg1), static_cast<int>(arg2));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_dup3
+    case SYS_dup3: {
+        auto fd = ::dup3(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_pipe
+    case SYS_pipe: {
+        int fds[2] {};
+        if (::pipe(fds) < 0)
+            return syscall_error(errno);
+        write_guest_fds(emulator, arg1, fds, 2);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_pipe2
+    case SYS_pipe2: {
+        int fds[2] {};
+        if (::pipe2(fds, static_cast<int>(arg2)) < 0)
+            return syscall_error(errno);
+        write_guest_fds(emulator, arg1, fds, 2);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_fcntl
+    case SYS_fcntl: {
+        long rc = ::fcntl(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<long>(arg3));
+        if (rc < 0)
+            return syscall_error(errno);
+        if (arg2 == F_DUPFD
+#ifdef F_DUPFD_CLOEXEC
+            || arg2 == F_DUPFD_CLOEXEC
+#endif
+        )
+            emulator.register_host_fd(static_cast<int>(rc));
+        return static_cast<u64>(rc);
+    }
+#endif
+
 #ifdef SYS_lseek
     case SYS_lseek:
         return syscall_result(::lseek(static_cast<int>(arg1), static_cast<off_t>(arg2), static_cast<int>(arg3)));
+#endif
+
+#ifdef SYS_stat
+    case SYS_stat: {
+        auto path = mmu.read_c_string(arg1);
+        struct stat st {};
+        if (::stat(path.c_str(), &st) < 0)
+            return syscall_error(errno);
+        auto guest = convert_stat(st);
+        mmu.copy_to_guest(arg2, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_lstat
+    case SYS_lstat: {
+        auto path = mmu.read_c_string(arg1);
+        struct stat st {};
+        if (::lstat(path.c_str(), &st) < 0)
+            return syscall_error(errno);
+        auto guest = convert_stat(st);
+        mmu.copy_to_guest(arg2, &guest, sizeof(guest));
+        return 0;
+    }
 #endif
 
 #ifdef SYS_fstat
@@ -539,6 +850,11 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         u64 size = page_align_up(arg2);
         int guest_prot = prot_from_linux(arg3);
         bool fixed = arg4 & MAP_FIXED;
+#ifdef MAP_FIXED_NOREPLACE
+        bool fixed_noreplace = arg4 & MAP_FIXED_NOREPLACE;
+#else
+        bool fixed_noreplace = false;
+#endif
         bool anonymous = arg4 & MAP_ANONYMOUS;
         u64 address = arg1;
         std::string mapping_name = "[mmap]";
@@ -549,8 +865,10 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
                 mapping_name = mapped_path.value();
         }
 
-        if (fixed) {
+        if (fixed || fixed_noreplace) {
             address = page_align_down(address);
+            if (fixed_noreplace && guest_range_is_mapped(mmu, address, size))
+                return syscall_error(EEXIST);
             mmu.unmap(address, size);
             mmu.map_zeroed(address, size, ProtRead | ProtWrite, mapping_name);
         } else {
@@ -632,6 +950,23 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         return syscall_result(::syscall(SYS_gettid));
 #endif
 
+#ifdef SYS_getppid
+    case SYS_getppid:
+        return static_cast<u64>(::getppid());
+#endif
+
+#ifdef SYS_getpgid
+    case SYS_getpgid: {
+        pid_t pid = static_cast<pid_t>(arg1);
+        return syscall_result(::getpgid(pid));
+    }
+#endif
+
+#ifdef SYS_getpgrp
+    case SYS_getpgrp:
+        return static_cast<u64>(::getpgrp());
+#endif
+
 #ifdef SYS_getuid
     case SYS_getuid:
         return static_cast<u64>(::getuid());
@@ -686,6 +1021,333 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
     }
 #endif
 
+#ifdef SYS_poll
+    case SYS_poll: {
+        if (arg2 > 4096)
+            return syscall_error(EINVAL);
+        std::vector<GuestPollFD> guest_fds(static_cast<size_t>(arg2));
+        std::vector<pollfd> host_fds(static_cast<size_t>(arg2));
+        if (arg2)
+            mmu.copy_from_guest(guest_fds.data(), arg1, guest_fds.size() * sizeof(GuestPollFD));
+        for (size_t i = 0; i < guest_fds.size(); ++i)
+            host_fds[i] = { guest_fds[i].fd, guest_fds[i].events, guest_fds[i].revents };
+        auto rc = ::poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()), static_cast<int>(arg3));
+        if (rc < 0)
+            return syscall_error(errno);
+        for (size_t i = 0; i < guest_fds.size(); ++i)
+            guest_fds[i].revents = host_fds[i].revents;
+        if (arg2)
+            mmu.copy_to_guest(arg1, guest_fds.data(), guest_fds.size() * sizeof(GuestPollFD));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_ppoll
+    case SYS_ppoll: {
+        if (arg2 > 4096)
+            return syscall_error(EINVAL);
+        std::vector<GuestPollFD> guest_fds(static_cast<size_t>(arg2));
+        std::vector<pollfd> host_fds(static_cast<size_t>(arg2));
+        if (arg2)
+            mmu.copy_from_guest(guest_fds.data(), arg1, guest_fds.size() * sizeof(GuestPollFD));
+        for (size_t i = 0; i < guest_fds.size(); ++i)
+            host_fds[i] = { guest_fds[i].fd, guest_fds[i].events, guest_fds[i].revents };
+        struct timespec timeout {};
+        struct timespec* timeout_ptr = nullptr;
+        if (arg3) {
+            GuestTimespec guest {};
+            mmu.copy_from_guest(&guest, arg3, sizeof(guest));
+            timeout = { static_cast<time_t>(guest.tv_sec), static_cast<long>(guest.tv_nsec) };
+            timeout_ptr = &timeout;
+        }
+        long rc = ::syscall(SYS_ppoll, host_fds.data(), static_cast<nfds_t>(host_fds.size()), timeout_ptr, nullptr, 0);
+        if (rc < 0)
+            return syscall_error(errno);
+        for (size_t i = 0; i < guest_fds.size(); ++i)
+            guest_fds[i].revents = host_fds[i].revents;
+        if (arg2)
+            mmu.copy_to_guest(arg1, guest_fds.data(), guest_fds.size() * sizeof(GuestPollFD));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_select
+    case SYS_select: {
+        std::array<u8, sizeof(fd_set)> readfds {};
+        std::array<u8, sizeof(fd_set)> writefds {};
+        std::array<u8, sizeof(fd_set)> exceptfds {};
+        fd_set* read_ptr = nullptr;
+        fd_set* write_ptr = nullptr;
+        fd_set* except_ptr = nullptr;
+        if (arg2) {
+            mmu.copy_from_guest(readfds.data(), arg2, readfds.size());
+            read_ptr = reinterpret_cast<fd_set*>(readfds.data());
+        }
+        if (arg3) {
+            mmu.copy_from_guest(writefds.data(), arg3, writefds.size());
+            write_ptr = reinterpret_cast<fd_set*>(writefds.data());
+        }
+        if (arg4) {
+            mmu.copy_from_guest(exceptfds.data(), arg4, exceptfds.size());
+            except_ptr = reinterpret_cast<fd_set*>(exceptfds.data());
+        }
+        struct timeval timeout {};
+        struct timeval* timeout_ptr = nullptr;
+        if (arg5) {
+            GuestTimeval guest {};
+            mmu.copy_from_guest(&guest, arg5, sizeof(guest));
+            timeout = { static_cast<time_t>(guest.tv_sec), static_cast<suseconds_t>(guest.tv_usec) };
+            timeout_ptr = &timeout;
+        }
+        auto rc = ::select(static_cast<int>(arg1), read_ptr, write_ptr, except_ptr, timeout_ptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        if (arg2)
+            mmu.copy_to_guest(arg2, readfds.data(), readfds.size());
+        if (arg3)
+            mmu.copy_to_guest(arg3, writefds.data(), writefds.size());
+        if (arg4)
+            mmu.copy_to_guest(arg4, exceptfds.data(), exceptfds.size());
+        if (arg5) {
+            GuestTimeval guest { static_cast<i64>(timeout.tv_sec), static_cast<i64>(timeout.tv_usec) };
+            mmu.copy_to_guest(arg5, &guest, sizeof(guest));
+        }
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_pselect6
+    case SYS_pselect6: {
+        std::array<u8, sizeof(fd_set)> readfds {};
+        std::array<u8, sizeof(fd_set)> writefds {};
+        std::array<u8, sizeof(fd_set)> exceptfds {};
+        fd_set* read_ptr = nullptr;
+        fd_set* write_ptr = nullptr;
+        fd_set* except_ptr = nullptr;
+        if (arg2) {
+            mmu.copy_from_guest(readfds.data(), arg2, readfds.size());
+            read_ptr = reinterpret_cast<fd_set*>(readfds.data());
+        }
+        if (arg3) {
+            mmu.copy_from_guest(writefds.data(), arg3, writefds.size());
+            write_ptr = reinterpret_cast<fd_set*>(writefds.data());
+        }
+        if (arg4) {
+            mmu.copy_from_guest(exceptfds.data(), arg4, exceptfds.size());
+            except_ptr = reinterpret_cast<fd_set*>(exceptfds.data());
+        }
+        struct timespec timeout {};
+        struct timespec* timeout_ptr = nullptr;
+        if (arg5) {
+            GuestTimespec guest {};
+            mmu.copy_from_guest(&guest, arg5, sizeof(guest));
+            timeout = { static_cast<time_t>(guest.tv_sec), static_cast<long>(guest.tv_nsec) };
+            timeout_ptr = &timeout;
+        }
+        long rc = ::syscall(SYS_pselect6, static_cast<int>(arg1), read_ptr, write_ptr, except_ptr, timeout_ptr, nullptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        if (arg2)
+            mmu.copy_to_guest(arg2, readfds.data(), readfds.size());
+        if (arg3)
+            mmu.copy_to_guest(arg3, writefds.data(), writefds.size());
+        if (arg4)
+            mmu.copy_to_guest(arg4, exceptfds.data(), exceptfds.size());
+        if (arg5) {
+            GuestTimespec guest { static_cast<i64>(timeout.tv_sec), static_cast<i64>(timeout.tv_nsec) };
+            mmu.copy_to_guest(arg5, &guest, sizeof(guest));
+        }
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_epoll_create1
+    case SYS_epoll_create1: {
+        int fd = ::epoll_create1(static_cast<int>(arg1));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_epoll_ctl
+    case SYS_epoll_ctl: {
+        std::array<u8, sizeof(epoll_event)> event {};
+        void* event_ptr = nullptr;
+        if (arg4) {
+            mmu.copy_from_guest(event.data(), arg4, event.size());
+            event_ptr = event.data();
+        }
+        return syscall_result(::syscall(SYS_epoll_ctl, static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3), event_ptr));
+    }
+#endif
+
+#ifdef SYS_epoll_wait
+    case SYS_epoll_wait: {
+        std::vector<u8> events(static_cast<size_t>(arg3) * sizeof(epoll_event));
+        long rc = ::syscall(SYS_epoll_wait, static_cast<int>(arg1), events.data(), static_cast<int>(arg3), static_cast<int>(arg4));
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, events.data(), static_cast<size_t>(rc) * sizeof(epoll_event));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_epoll_pwait
+    case SYS_epoll_pwait: {
+        std::vector<u8> events(static_cast<size_t>(arg3) * sizeof(epoll_event));
+        long rc = ::syscall(SYS_epoll_pwait, static_cast<int>(arg1), events.data(), static_cast<int>(arg3), static_cast<int>(arg4), nullptr, 0);
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, events.data(), static_cast<size_t>(rc) * sizeof(epoll_event));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_socket
+    case SYS_socket: {
+        int fd = ::socket(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_socketpair
+    case SYS_socketpair: {
+        int fds[2] {};
+        if (::socketpair(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3), fds) < 0)
+            return syscall_error(errno);
+        write_guest_fds(emulator, arg4, fds, 2);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_bind
+    case SYS_bind: {
+        auto address = optional_sockaddr_from_guest(mmu, arg2, arg3);
+        return syscall_result(::bind(static_cast<int>(arg1), reinterpret_cast<const sockaddr*>(address.data()), static_cast<socklen_t>(address.size())));
+    }
+#endif
+
+#ifdef SYS_listen
+    case SYS_listen:
+        return syscall_result(::listen(static_cast<int>(arg1), static_cast<int>(arg2)));
+#endif
+
+#ifdef SYS_accept
+    case SYS_accept: {
+        socklen_t length = 0;
+        if (arg3)
+            length = mmu.read32(arg3);
+        std::vector<u8> address(length);
+        int fd = ::accept(static_cast<int>(arg1), arg2 ? reinterpret_cast<sockaddr*>(address.data()) : nullptr, arg3 ? &length : nullptr);
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        copy_sockaddr_to_guest(mmu, arg2, arg3, address, length);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_accept4
+    case SYS_accept4: {
+        socklen_t length = 0;
+        if (arg3)
+            length = mmu.read32(arg3);
+        std::vector<u8> address(length);
+        int fd = ::accept4(static_cast<int>(arg1), arg2 ? reinterpret_cast<sockaddr*>(address.data()) : nullptr, arg3 ? &length : nullptr, static_cast<int>(arg4));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        copy_sockaddr_to_guest(mmu, arg2, arg3, address, length);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_connect
+    case SYS_connect: {
+        auto address = optional_sockaddr_from_guest(mmu, arg2, arg3);
+        return syscall_result(::connect(static_cast<int>(arg1), reinterpret_cast<const sockaddr*>(address.data()), static_cast<socklen_t>(address.size())));
+    }
+#endif
+
+#ifdef SYS_getsockname
+    case SYS_getsockname: {
+        socklen_t length = arg3 ? mmu.read32(arg3) : 0;
+        std::vector<u8> address(length);
+        auto rc = ::getsockname(static_cast<int>(arg1), arg2 ? reinterpret_cast<sockaddr*>(address.data()) : nullptr, arg3 ? &length : nullptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        copy_sockaddr_to_guest(mmu, arg2, arg3, address, length);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_getpeername
+    case SYS_getpeername: {
+        socklen_t length = arg3 ? mmu.read32(arg3) : 0;
+        std::vector<u8> address(length);
+        auto rc = ::getpeername(static_cast<int>(arg1), arg2 ? reinterpret_cast<sockaddr*>(address.data()) : nullptr, arg3 ? &length : nullptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        copy_sockaddr_to_guest(mmu, arg2, arg3, address, length);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_setsockopt
+    case SYS_setsockopt: {
+        auto value = arg4 ? mmu.copy_buffer_from_guest(arg4, static_cast<size_t>(arg5)) : std::vector<u8> {};
+        return syscall_result(::setsockopt(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3), value.data(), static_cast<socklen_t>(value.size())));
+    }
+#endif
+
+#ifdef SYS_getsockopt
+    case SYS_getsockopt: {
+        socklen_t length = arg5 ? mmu.read32(arg5) : 0;
+        std::vector<u8> value(length);
+        auto rc = ::getsockopt(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3), value.data(), &length);
+        if (rc < 0)
+            return syscall_error(errno);
+        if (arg4)
+            mmu.copy_to_guest(arg4, value.data(), std::min<size_t>(value.size(), length));
+        if (arg5)
+            mmu.write32(arg5, length);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_sendto
+    case SYS_sendto: {
+        auto buffer = mmu.copy_buffer_from_guest(arg2, static_cast<size_t>(arg3));
+        auto address = optional_sockaddr_from_guest(mmu, arg5, arg6);
+        const sockaddr* address_ptr = address.empty() ? nullptr : reinterpret_cast<const sockaddr*>(address.data());
+        return syscall_result(::sendto(static_cast<int>(arg1), buffer.data(), buffer.size(), static_cast<int>(arg4), address_ptr, static_cast<socklen_t>(address.size())));
+    }
+#endif
+
+#ifdef SYS_recvfrom
+    case SYS_recvfrom: {
+        std::vector<u8> buffer(static_cast<size_t>(arg3));
+        socklen_t length = arg6 ? mmu.read32(arg6) : 0;
+        std::vector<u8> address(length);
+        auto rc = ::recvfrom(static_cast<int>(arg1), buffer.data(), buffer.size(), static_cast<int>(arg4), arg5 ? reinterpret_cast<sockaddr*>(address.data()) : nullptr, arg6 ? &length : nullptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, buffer.data(), static_cast<size_t>(rc));
+        copy_sockaddr_to_guest(mmu, arg5, arg6, address, length);
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_shutdown
+    case SYS_shutdown:
+        return syscall_result(::shutdown(static_cast<int>(arg1), static_cast<int>(arg2)));
+#endif
+
 #ifdef SYS_clock_gettime
     case SYS_clock_gettime: {
         struct timespec ts {};
@@ -694,6 +1356,64 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         GuestTimespec guest { static_cast<i64>(ts.tv_sec), static_cast<i64>(ts.tv_nsec) };
         mmu.copy_to_guest(arg2, &guest, sizeof(guest));
         return 0;
+    }
+#endif
+
+#ifdef SYS_clock_nanosleep
+    case SYS_clock_nanosleep: {
+        GuestTimespec guest_request {};
+        mmu.copy_from_guest(&guest_request, arg3, sizeof(guest_request));
+        struct timespec request { static_cast<time_t>(guest_request.tv_sec), static_cast<long>(guest_request.tv_nsec) };
+        struct timespec remain {};
+        auto rc = ::clock_nanosleep(static_cast<clockid_t>(arg1), static_cast<int>(arg2), &request, arg4 ? &remain : nullptr);
+        if (rc != 0)
+            return syscall_error(rc);
+        if (arg4) {
+            GuestTimespec guest_remain { static_cast<i64>(remain.tv_sec), static_cast<i64>(remain.tv_nsec) };
+            mmu.copy_to_guest(arg4, &guest_remain, sizeof(guest_remain));
+        }
+        return 0;
+    }
+#endif
+
+#ifdef SYS_gettimeofday
+    case SYS_gettimeofday: {
+        struct timeval tv {};
+        if (::gettimeofday(&tv, nullptr) < 0)
+            return syscall_error(errno);
+        if (arg1) {
+            GuestTimeval guest { static_cast<i64>(tv.tv_sec), static_cast<i64>(tv.tv_usec) };
+            mmu.copy_to_guest(arg1, &guest, sizeof(guest));
+        }
+        return 0;
+    }
+#endif
+
+#ifdef SYS_nanosleep
+    case SYS_nanosleep: {
+        GuestTimespec guest_request {};
+        mmu.copy_from_guest(&guest_request, arg1, sizeof(guest_request));
+        struct timespec request { static_cast<time_t>(guest_request.tv_sec), static_cast<long>(guest_request.tv_nsec) };
+        struct timespec remain {};
+        auto rc = ::nanosleep(&request, arg2 ? &remain : nullptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        if (arg2) {
+            GuestTimespec guest_remain { static_cast<i64>(remain.tv_sec), static_cast<i64>(remain.tv_nsec) };
+            mmu.copy_to_guest(arg2, &guest_remain, sizeof(guest_remain));
+        }
+        return 0;
+    }
+#endif
+
+#ifdef SYS_time
+    case SYS_time: {
+        auto now = ::time(nullptr);
+        if (now == static_cast<time_t>(-1))
+            return syscall_error(errno);
+        if (arg1)
+            mmu.write64(arg1, static_cast<u64>(now));
+        return static_cast<u64>(now);
     }
 #endif
 
@@ -869,6 +1589,31 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
             return static_cast<u64>(static_cast<i64>(rc));
         return 0;
     }
+#endif
+
+#ifdef SYS_wait4
+    case SYS_wait4:
+        return syscall_error(ECHILD);
+#endif
+
+#ifdef SYS_execve
+    case SYS_execve:
+        return syscall_error(ENOSYS);
+#endif
+
+#ifdef SYS_clone
+    case SYS_clone:
+        return syscall_error(ENOSYS);
+#endif
+
+#ifdef SYS_fork
+    case SYS_fork:
+        return syscall_error(ENOSYS);
+#endif
+
+#ifdef SYS_vfork
+    case SYS_vfork:
+        return syscall_error(ENOSYS);
 #endif
 
 #ifdef SYS_futex

@@ -14,6 +14,7 @@ cc -static -O0 -o /tmp/lue-hello-c "$repo_dir/tests/hello-c.c"
 cc -static -O0 -o /tmp/lue-args-env "$repo_dir/tests/args-env.c"
 cc -static -O0 -o /tmp/lue-cat-static "$repo_dir/tests/cat-static.c"
 cc -static -O0 -o /tmp/lue-mmap-brk "$repo_dir/tests/mmap-brk.c"
+cc -static -O0 -o /tmp/lue-syscall-coverage "$repo_dir/tests/syscall-coverage.c"
 cc -O0 -o /tmp/lue-signal-basic "$repo_dir/tests/signal-basic.c"
 cc -O0 -o /tmp/lue-host-signal "$repo_dir/tests/host-signal.c"
 cc -nostdlib -static -o /tmp/lue-fs-tls "$repo_dir/tests/fs-tls.S"
@@ -144,6 +145,7 @@ printf 'cat input\n' >/tmp/lue-cat-input
 run_and_check cat-static "cat input" "$emulator" /tmp/lue-cat-static /tmp/lue-cat-input
 
 run_and_check mmap-brk $'heap ok\nmmap ok' "$emulator" /tmp/lue-mmap-brk
+run_and_check syscall-coverage "syscall coverage ok" "$emulator" /tmp/lue-syscall-coverage
 run_and_check signal-basic $'before\nhandled\nafter' "$emulator" /tmp/lue-signal-basic
 run_and_check_host_signal host-signal
 run_and_check fs-tls "fs ok" "$emulator" /tmp/lue-fs-tls

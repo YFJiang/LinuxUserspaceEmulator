@@ -1397,6 +1397,20 @@ void SoftCPU64::step()
     case 0x68:
         push64(sign_extend(fetch32(), 32));
         break;
+    case 0x69:
+    case 0x6b: {
+        int width = operand_width(prefixes);
+        auto modrm = fetch_modrm(prefixes);
+        auto source = decode_rm_operand(prefixes, modrm);
+        i64 lhs = static_cast<i64>(sign_extend(read_operand(source, width, prefixes), width));
+        i64 imm = opcode == 0x6b ? static_cast<i64>(sign_extend(fetch8(), 8)) : static_cast<i64>(sign_extend(fetch32(), 32));
+        __int128 result = static_cast<__int128>(lhs) * static_cast<__int128>(imm);
+        write_gpr(modrm.reg, width, static_cast<u64>(result), prefixes);
+        __int128 narrowed = static_cast<__int128>(static_cast<i64>(sign_extend(static_cast<u64>(result), width)));
+        set_flag(CF, result != narrowed);
+        set_flag(OF, result != narrowed);
+        break;
+    }
     case 0x6a:
         push64(sign_extend(fetch8(), 8));
         break;
@@ -1932,6 +1946,16 @@ std::string SoftCPU64::describe_current_instruction() const
     case 0x63: {
         auto modrm = read_modrm();
         out << "movsxd " << rm_text(modrm, 32) << ", " << reg_text(modrm.reg, operand_width());
+        return with_prefixes(out.str());
+    }
+    case 0x69:
+    case 0x6b: {
+        auto modrm = read_modrm();
+        int width = operand_width();
+        int trailing_bytes = opcode == 0x6b ? 1 : 4;
+        auto source = rm_text(modrm, width, trailing_bytes);
+        i64 imm = opcode == 0x6b ? cursor.read_i8() : cursor.read_i32();
+        out << "imul " << imm_text(imm) << ", " << source << ", " << reg_text(modrm.reg, width);
         return with_prefixes(out.str());
     }
     case 0x68:
