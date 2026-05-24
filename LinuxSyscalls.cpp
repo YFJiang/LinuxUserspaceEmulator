@@ -1,0 +1,803 @@
+#include "LinuxSyscalls.h"
+
+#include "Emulator.h"
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <iostream>
+#include <optional>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/uio.h>
+#include <termios.h>
+#include <unistd.h>
+
+#ifdef __linux__
+#    include <asm/prctl.h>
+#    include <linux/futex.h>
+#endif
+
+#ifndef SYS_pread64
+#    ifdef __NR_pread64
+#        define SYS_pread64 __NR_pread64
+#    else
+#        define SYS_pread64 17
+#    endif
+#endif
+
+#ifndef SYS_pwrite64
+#    ifdef __NR_pwrite64
+#        define SYS_pwrite64 __NR_pwrite64
+#    else
+#        define SYS_pwrite64 18
+#    endif
+#endif
+
+#ifndef SYS_access
+#    ifdef __NR_access
+#        define SYS_access __NR_access
+#    else
+#        define SYS_access 21
+#    endif
+#endif
+
+namespace LUE {
+namespace {
+
+u64 syscall_error(int err)
+{
+    return static_cast<u64>(-static_cast<i64>(err));
+}
+
+u64 syscall_result(long rc)
+{
+    if (rc < 0)
+        return syscall_error(errno);
+    return static_cast<u64>(rc);
+}
+
+const char* syscall_name(u64 number)
+{
+    switch (number) {
+#ifdef SYS_read
+    case SYS_read:
+        return "read";
+#endif
+#ifdef SYS_write
+    case SYS_write:
+        return "write";
+#endif
+#ifdef SYS_readv
+    case SYS_readv:
+        return "readv";
+#endif
+#ifdef SYS_writev
+    case SYS_writev:
+        return "writev";
+#endif
+#ifdef SYS_pread64
+    case SYS_pread64:
+        return "pread64";
+#endif
+#ifdef SYS_pwrite64
+    case SYS_pwrite64:
+        return "pwrite64";
+#endif
+#ifdef SYS_open
+    case SYS_open:
+        return "open";
+#endif
+#ifdef SYS_openat
+    case SYS_openat:
+        return "openat";
+#endif
+#ifdef SYS_close
+    case SYS_close:
+        return "close";
+#endif
+#ifdef SYS_lseek
+    case SYS_lseek:
+        return "lseek";
+#endif
+#ifdef SYS_fstat
+    case SYS_fstat:
+        return "fstat";
+#endif
+#ifdef SYS_newfstatat
+    case SYS_newfstatat:
+        return "newfstatat";
+#endif
+#ifdef SYS_mmap
+    case SYS_mmap:
+        return "mmap";
+#endif
+#ifdef SYS_munmap
+    case SYS_munmap:
+        return "munmap";
+#endif
+#ifdef SYS_mprotect
+    case SYS_mprotect:
+        return "mprotect";
+#endif
+#ifdef SYS_brk
+    case SYS_brk:
+        return "brk";
+#endif
+#ifdef SYS_arch_prctl
+    case SYS_arch_prctl:
+        return "arch_prctl";
+#endif
+#ifdef SYS_exit
+    case SYS_exit:
+        return "exit";
+#endif
+#ifdef SYS_exit_group
+    case SYS_exit_group:
+        return "exit_group";
+#endif
+#ifdef SYS_getpid
+    case SYS_getpid:
+        return "getpid";
+#endif
+#ifdef SYS_getuid
+    case SYS_getuid:
+        return "getuid";
+#endif
+#ifdef SYS_geteuid
+    case SYS_geteuid:
+        return "geteuid";
+#endif
+#ifdef SYS_getgid
+    case SYS_getgid:
+        return "getgid";
+#endif
+#ifdef SYS_getegid
+    case SYS_getegid:
+        return "getegid";
+#endif
+#ifdef SYS_gettid
+    case SYS_gettid:
+        return "gettid";
+#endif
+#ifdef SYS_getcwd
+    case SYS_getcwd:
+        return "getcwd";
+#endif
+#ifdef SYS_ioctl
+    case SYS_ioctl:
+        return "ioctl";
+#endif
+#ifdef SYS_clock_gettime
+    case SYS_clock_gettime:
+        return "clock_gettime";
+#endif
+#ifdef SYS_getrandom
+    case SYS_getrandom:
+        return "getrandom";
+#endif
+#ifdef SYS_uname
+    case SYS_uname:
+        return "uname";
+#endif
+#ifdef SYS_access
+    case SYS_access:
+        return "access";
+#endif
+#ifdef SYS_faccessat
+    case SYS_faccessat:
+        return "faccessat";
+#endif
+#ifdef SYS_readlink
+    case SYS_readlink:
+        return "readlink";
+#endif
+#ifdef SYS_getdents64
+    case SYS_getdents64:
+        return "getdents64";
+#endif
+#ifdef SYS_prlimit64
+    case SYS_prlimit64:
+        return "prlimit64";
+#endif
+#ifdef SYS_set_tid_address
+    case SYS_set_tid_address:
+        return "set_tid_address";
+#endif
+#ifdef SYS_set_robust_list
+    case SYS_set_robust_list:
+        return "set_robust_list";
+#endif
+#ifdef SYS_rseq
+    case SYS_rseq:
+        return "rseq";
+#endif
+    default:
+        return "unknown";
+    }
+}
+
+struct GuestTimespec {
+    i64 tv_sec;
+    i64 tv_nsec;
+};
+
+struct GuestIOVec {
+    u64 base;
+    u64 length;
+};
+
+struct GuestStat {
+    u64 st_dev;
+    u64 st_ino;
+    u64 st_nlink;
+    u32 st_mode;
+    u32 st_uid;
+    u32 st_gid;
+    u32 __pad0;
+    u64 st_rdev;
+    i64 st_size;
+    i64 st_blksize;
+    i64 st_blocks;
+    i64 st_atime_sec;
+    i64 st_atime_nsec;
+    i64 st_mtime_sec;
+    i64 st_mtime_nsec;
+    i64 st_ctime_sec;
+    i64 st_ctime_nsec;
+    i64 __unused[3];
+};
+
+struct GuestUtsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+struct GuestRLimit64 {
+    u64 rlim_cur;
+    u64 rlim_max;
+};
+
+static_assert(sizeof(GuestTimespec) == 16);
+static_assert(sizeof(GuestIOVec) == 16);
+static_assert(sizeof(GuestStat) == 144);
+static_assert(sizeof(GuestUtsname) == 390);
+static_assert(sizeof(GuestRLimit64) == 16);
+
+GuestStat convert_stat(const struct stat& st)
+{
+    GuestStat out {};
+    out.st_dev = static_cast<u64>(st.st_dev);
+    out.st_ino = static_cast<u64>(st.st_ino);
+    out.st_nlink = static_cast<u64>(st.st_nlink);
+    out.st_mode = static_cast<u32>(st.st_mode);
+    out.st_uid = static_cast<u32>(st.st_uid);
+    out.st_gid = static_cast<u32>(st.st_gid);
+    out.st_rdev = static_cast<u64>(st.st_rdev);
+    out.st_size = static_cast<i64>(st.st_size);
+    out.st_blksize = static_cast<i64>(st.st_blksize);
+    out.st_blocks = static_cast<i64>(st.st_blocks);
+#if defined(__APPLE__)
+    out.st_atime_sec = st.st_atimespec.tv_sec;
+    out.st_atime_nsec = st.st_atimespec.tv_nsec;
+    out.st_mtime_sec = st.st_mtimespec.tv_sec;
+    out.st_mtime_nsec = st.st_mtimespec.tv_nsec;
+    out.st_ctime_sec = st.st_ctimespec.tv_sec;
+    out.st_ctime_nsec = st.st_ctimespec.tv_nsec;
+#else
+    out.st_atime_sec = st.st_atim.tv_sec;
+    out.st_atime_nsec = st.st_atim.tv_nsec;
+    out.st_mtime_sec = st.st_mtim.tv_sec;
+    out.st_mtime_nsec = st.st_mtim.tv_nsec;
+    out.st_ctime_sec = st.st_ctim.tv_sec;
+    out.st_ctime_nsec = st.st_ctim.tv_nsec;
+#endif
+    return out;
+}
+
+int prot_from_linux(u64 prot)
+{
+    int result = 0;
+    if (prot & PROT_READ)
+        result |= ProtRead;
+    if (prot & PROT_WRITE)
+        result |= ProtWrite;
+    if (prot & PROT_EXEC)
+        result |= ProtExecute;
+    return result;
+}
+
+void copy_capped(char* destination, const char* source, size_t size)
+{
+    std::strncpy(destination, source, size - 1);
+    destination[size - 1] = '\0';
+}
+
+}
+
+u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
+{
+    auto& cpu = emulator.cpu();
+    auto& mmu = emulator.mmu();
+
+    u64 arg1 = cpu.reg(SoftCPU64::RDI);
+    u64 arg2 = cpu.reg(SoftCPU64::RSI);
+    u64 arg3 = cpu.reg(SoftCPU64::RDX);
+    u64 arg4 = cpu.reg(SoftCPU64::R10);
+    u64 arg5 = cpu.reg(SoftCPU64::R8);
+    u64 arg6 = cpu.reg(SoftCPU64::R9);
+
+    if (emulator.options().trace_syscalls) {
+        std::cerr << "syscall " << syscall_name(number) << "(" << number << ")"
+                  << " " << hex(arg1) << " " << hex(arg2) << " " << hex(arg3)
+                  << " " << hex(arg4) << " " << hex(arg5) << " " << hex(arg6) << "\n";
+    }
+
+    switch (number) {
+#ifdef SYS_read
+    case SYS_read: {
+        std::vector<u8> buffer(static_cast<size_t>(arg3));
+        auto rc = ::read(static_cast<int>(arg1), buffer.data(), buffer.size());
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, buffer.data(), static_cast<size_t>(rc));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_write
+    case SYS_write: {
+        auto buffer = mmu.copy_buffer_from_guest(arg2, static_cast<size_t>(arg3));
+        return syscall_result(::write(static_cast<int>(arg1), buffer.data(), buffer.size()));
+    }
+#endif
+
+#ifdef SYS_readv
+    case SYS_readv: {
+        if (arg3 > 1024)
+            return syscall_error(EINVAL);
+        std::vector<GuestIOVec> guest_iov(static_cast<size_t>(arg3));
+        mmu.copy_from_guest(guest_iov.data(), arg2, guest_iov.size() * sizeof(GuestIOVec));
+
+        std::vector<std::vector<u8>> buffers;
+        std::vector<iovec> host_iov;
+        buffers.reserve(guest_iov.size());
+        host_iov.reserve(guest_iov.size());
+        for (auto const& entry : guest_iov) {
+            buffers.emplace_back(static_cast<size_t>(entry.length));
+            host_iov.push_back({ buffers.back().data(), buffers.back().size() });
+        }
+
+        auto rc = ::readv(static_cast<int>(arg1), host_iov.data(), static_cast<int>(host_iov.size()));
+        if (rc < 0)
+            return syscall_error(errno);
+
+        size_t remaining = static_cast<size_t>(rc);
+        for (size_t i = 0; i < guest_iov.size() && remaining; ++i) {
+            size_t to_copy = std::min<size_t>(remaining, buffers[i].size());
+            mmu.copy_to_guest(guest_iov[i].base, buffers[i].data(), to_copy);
+            remaining -= to_copy;
+        }
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_writev
+    case SYS_writev: {
+        if (arg3 > 1024)
+            return syscall_error(EINVAL);
+        std::vector<GuestIOVec> guest_iov(static_cast<size_t>(arg3));
+        mmu.copy_from_guest(guest_iov.data(), arg2, guest_iov.size() * sizeof(GuestIOVec));
+
+        std::vector<std::vector<u8>> buffers;
+        std::vector<iovec> host_iov;
+        buffers.reserve(guest_iov.size());
+        host_iov.reserve(guest_iov.size());
+        for (auto const& entry : guest_iov) {
+            buffers.push_back(mmu.copy_buffer_from_guest(entry.base, static_cast<size_t>(entry.length)));
+            host_iov.push_back({ buffers.back().data(), buffers.back().size() });
+        }
+
+        return syscall_result(::writev(static_cast<int>(arg1), host_iov.data(), static_cast<int>(host_iov.size())));
+    }
+#endif
+
+#ifdef SYS_pread64
+    case SYS_pread64: {
+        std::vector<u8> buffer(static_cast<size_t>(arg3));
+        auto rc = ::pread(static_cast<int>(arg1), buffer.data(), buffer.size(), static_cast<off_t>(arg4));
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, buffer.data(), static_cast<size_t>(rc));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_pwrite64
+    case SYS_pwrite64: {
+        auto buffer = mmu.copy_buffer_from_guest(arg2, static_cast<size_t>(arg3));
+        return syscall_result(::pwrite(static_cast<int>(arg1), buffer.data(), buffer.size(), static_cast<off_t>(arg4)));
+    }
+#endif
+
+#ifdef SYS_open
+    case SYS_open: {
+        auto path = mmu.read_c_string(arg1);
+        auto fd = ::open(path.c_str(), static_cast<int>(arg2), static_cast<mode_t>(arg3));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_openat
+    case SYS_openat: {
+        auto path = mmu.read_c_string(arg2);
+        auto fd = ::openat(static_cast<int>(arg1), path.c_str(), static_cast<int>(arg3), static_cast<mode_t>(arg4));
+        if (fd < 0)
+            return syscall_error(errno);
+        emulator.register_host_fd(fd);
+        return static_cast<u64>(fd);
+    }
+#endif
+
+#ifdef SYS_close
+    case SYS_close: {
+        int fd = static_cast<int>(arg1);
+        auto rc = ::close(fd);
+        if (rc < 0)
+            return syscall_error(errno);
+        emulator.unregister_host_fd(fd);
+        return 0;
+    }
+#endif
+
+#ifdef SYS_lseek
+    case SYS_lseek:
+        return syscall_result(::lseek(static_cast<int>(arg1), static_cast<off_t>(arg2), static_cast<int>(arg3)));
+#endif
+
+#ifdef SYS_fstat
+    case SYS_fstat: {
+        struct stat st {};
+        if (::fstat(static_cast<int>(arg1), &st) < 0)
+            return syscall_error(errno);
+        auto guest = convert_stat(st);
+        mmu.copy_to_guest(arg2, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_newfstatat
+    case SYS_newfstatat: {
+        std::string path;
+        const char* path_ptr = nullptr;
+        if (arg2) {
+            path = mmu.read_c_string(arg2);
+            path_ptr = path.c_str();
+        }
+        struct stat st {};
+        long rc = ::syscall(SYS_newfstatat, static_cast<int>(arg1), path_ptr, &st, static_cast<int>(arg4));
+        if (rc < 0)
+            return syscall_error(errno);
+        auto guest = convert_stat(st);
+        mmu.copy_to_guest(arg3, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_mmap
+    case SYS_mmap: {
+        if (arg2 == 0)
+            return syscall_error(EINVAL);
+        u64 size = page_align_up(arg2);
+        int guest_prot = prot_from_linux(arg3);
+        bool fixed = arg4 & MAP_FIXED;
+        bool anonymous = arg4 & MAP_ANONYMOUS;
+        u64 address = arg1;
+        std::string mapping_name = "[mmap]";
+        std::optional<std::string> mapped_path;
+        if (!anonymous) {
+            mapped_path = emulator.path_for_fd(static_cast<int>(arg5));
+            if (mapped_path.has_value())
+                mapping_name = mapped_path.value();
+        }
+
+        if (fixed) {
+            address = page_align_down(address);
+            mmu.unmap(address, size);
+            mmu.map_zeroed(address, size, ProtRead | ProtWrite, mapping_name);
+        } else {
+            address = mmu.allocate(size, page_size, ProtRead | ProtWrite, mapping_name);
+        }
+
+        if (!anonymous) {
+            std::vector<u8> file_data(static_cast<size_t>(size));
+            auto rc = ::pread(static_cast<int>(arg5), file_data.data(), file_data.size(), static_cast<off_t>(arg6));
+            if (rc < 0) {
+                mmu.unmap(address, size);
+                return syscall_error(errno);
+            }
+            mmu.copy_to_guest(address, file_data.data(), static_cast<size_t>(rc));
+            if (arg6 == 0 && mapped_path.has_value())
+                emulator.register_mapped_file(mapped_path.value(), address);
+        }
+        mmu.protect(address, size, guest_prot);
+        return address;
+    }
+#endif
+
+#ifdef SYS_munmap
+    case SYS_munmap:
+        mmu.unmap(arg1, arg2);
+        return 0;
+#endif
+
+#ifdef SYS_mprotect
+    case SYS_mprotect:
+        mmu.protect(arg1, arg2, prot_from_linux(arg3));
+        return 0;
+#endif
+
+#ifdef SYS_brk
+    case SYS_brk:
+        return emulator.set_brk(arg1);
+#endif
+
+#ifdef SYS_arch_prctl
+    case SYS_arch_prctl:
+        switch (arg1) {
+#ifdef ARCH_SET_FS
+        case ARCH_SET_FS:
+            cpu.set_fs_base(arg2);
+            return 0;
+        case ARCH_GET_FS:
+            mmu.write64(arg2, cpu.fs_base());
+            return 0;
+        case ARCH_SET_GS:
+            cpu.set_gs_base(arg2);
+            return 0;
+        case ARCH_GET_GS:
+            mmu.write64(arg2, cpu.gs_base());
+            return 0;
+#endif
+        default:
+            return syscall_error(EINVAL);
+        }
+#endif
+
+#ifdef SYS_exit
+    case SYS_exit:
+        throw GuestExit(static_cast<int>(arg1));
+#endif
+
+#ifdef SYS_exit_group
+    case SYS_exit_group:
+        throw GuestExit(static_cast<int>(arg1));
+#endif
+
+#ifdef SYS_getpid
+    case SYS_getpid:
+        return static_cast<u64>(::getpid());
+#endif
+
+#ifdef SYS_gettid
+    case SYS_gettid:
+        return syscall_result(::syscall(SYS_gettid));
+#endif
+
+#ifdef SYS_getuid
+    case SYS_getuid:
+        return static_cast<u64>(::getuid());
+#endif
+
+#ifdef SYS_geteuid
+    case SYS_geteuid:
+        return static_cast<u64>(::geteuid());
+#endif
+
+#ifdef SYS_getgid
+    case SYS_getgid:
+        return static_cast<u64>(::getgid());
+#endif
+
+#ifdef SYS_getegid
+    case SYS_getegid:
+        return static_cast<u64>(::getegid());
+#endif
+
+#ifdef SYS_getcwd
+    case SYS_getcwd: {
+        std::vector<char> buffer(static_cast<size_t>(arg2));
+        if (!::getcwd(buffer.data(), buffer.size()))
+            return syscall_error(errno);
+        size_t length = std::strlen(buffer.data()) + 1;
+        mmu.copy_to_guest(arg1, buffer.data(), length);
+        return length;
+    }
+#endif
+
+#ifdef SYS_ioctl
+    case SYS_ioctl: {
+        if (arg3 == 0)
+            return syscall_result(::ioctl(static_cast<int>(arg1), static_cast<unsigned long>(arg2), 0));
+        std::array<u8, 256> scratch {};
+        if (mmu.is_mapped(arg3, 1)) {
+            size_t copy_size = std::min<size_t>(scratch.size(), 128);
+            try {
+                mmu.copy_from_guest(scratch.data(), arg3, copy_size);
+            } catch (const EmulatorError&) {
+            }
+        }
+        long rc = ::ioctl(static_cast<int>(arg1), static_cast<unsigned long>(arg2), scratch.data());
+        if (rc < 0)
+            return syscall_error(errno);
+        try {
+            mmu.copy_to_guest(arg3, scratch.data(), scratch.size());
+        } catch (const EmulatorError&) {
+        }
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_clock_gettime
+    case SYS_clock_gettime: {
+        struct timespec ts {};
+        if (::clock_gettime(static_cast<clockid_t>(arg1), &ts) < 0)
+            return syscall_error(errno);
+        GuestTimespec guest { static_cast<i64>(ts.tv_sec), static_cast<i64>(ts.tv_nsec) };
+        mmu.copy_to_guest(arg2, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_getrandom
+    case SYS_getrandom: {
+        std::vector<u8> buffer(static_cast<size_t>(arg2));
+        long rc = ::syscall(SYS_getrandom, buffer.data(), buffer.size(), static_cast<unsigned int>(arg3));
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg1, buffer.data(), static_cast<size_t>(rc));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_uname
+    case SYS_uname: {
+        struct utsname host {};
+        if (::uname(&host) < 0)
+            return syscall_error(errno);
+        GuestUtsname guest {};
+        copy_capped(guest.sysname, host.sysname, sizeof(guest.sysname));
+        copy_capped(guest.nodename, host.nodename, sizeof(guest.nodename));
+        copy_capped(guest.release, host.release, sizeof(guest.release));
+        copy_capped(guest.version, host.version, sizeof(guest.version));
+        copy_capped(guest.machine, "x86_64", sizeof(guest.machine));
+#ifdef _GNU_SOURCE
+        copy_capped(guest.domainname, host.domainname, sizeof(guest.domainname));
+#endif
+        mmu.copy_to_guest(arg1, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_access
+    case SYS_access: {
+        auto path = mmu.read_c_string(arg1);
+        return syscall_result(::access(path.c_str(), static_cast<int>(arg2)));
+    }
+#endif
+
+#ifdef SYS_faccessat
+    case SYS_faccessat: {
+        auto path = mmu.read_c_string(arg2);
+        return syscall_result(::faccessat(static_cast<int>(arg1), path.c_str(), static_cast<int>(arg3), static_cast<int>(arg4)));
+    }
+#endif
+
+#ifdef SYS_readlink
+    case SYS_readlink: {
+        auto path = mmu.read_c_string(arg1);
+        std::vector<char> buffer(static_cast<size_t>(arg3));
+        auto rc = ::readlink(path.c_str(), buffer.data(), buffer.size());
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, buffer.data(), static_cast<size_t>(rc));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_getdents64
+    case SYS_getdents64: {
+        std::vector<u8> buffer(static_cast<size_t>(arg3));
+        long rc = ::syscall(SYS_getdents64, static_cast<int>(arg1), buffer.data(), buffer.size());
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg2, buffer.data(), static_cast<size_t>(rc));
+        return static_cast<u64>(rc);
+    }
+#endif
+
+#ifdef SYS_prlimit64
+    case SYS_prlimit64: {
+        struct rlimit new_limit {};
+        struct rlimit old_limit {};
+        struct rlimit* new_limit_ptr = nullptr;
+        struct rlimit* old_limit_ptr = arg4 ? &old_limit : nullptr;
+        if (arg3) {
+            GuestRLimit64 guest {};
+            mmu.copy_from_guest(&guest, arg3, sizeof(guest));
+            new_limit.rlim_cur = static_cast<rlim_t>(guest.rlim_cur);
+            new_limit.rlim_max = static_cast<rlim_t>(guest.rlim_max);
+            new_limit_ptr = &new_limit;
+        }
+        long rc = ::syscall(SYS_prlimit64, static_cast<pid_t>(arg1), static_cast<int>(arg2), new_limit_ptr, old_limit_ptr);
+        if (rc < 0)
+            return syscall_error(errno);
+        if (arg4) {
+            GuestRLimit64 guest { static_cast<u64>(old_limit.rlim_cur), static_cast<u64>(old_limit.rlim_max) };
+            mmu.copy_to_guest(arg4, &guest, sizeof(guest));
+        }
+        return 0;
+    }
+#endif
+
+#ifdef SYS_set_tid_address
+    case SYS_set_tid_address:
+#ifdef SYS_gettid
+        return syscall_result(::syscall(SYS_gettid));
+#else
+        return static_cast<u64>(::getpid());
+#endif
+#endif
+
+#ifdef SYS_set_robust_list
+    case SYS_set_robust_list:
+        return 0;
+#endif
+
+#ifdef SYS_rt_sigaction
+    case SYS_rt_sigaction:
+        return 0;
+#endif
+
+#ifdef SYS_rt_sigprocmask
+    case SYS_rt_sigprocmask:
+        return 0;
+#endif
+
+#ifdef SYS_futex
+    case SYS_futex: {
+        int futex_op = static_cast<int>(arg2) & 0x7f;
+        if (futex_op == FUTEX_WAKE)
+            return 0;
+        if (futex_op == FUTEX_WAIT)
+            return syscall_error(EAGAIN);
+        return syscall_error(ENOSYS);
+    }
+#endif
+
+#ifdef SYS_rseq
+    case SYS_rseq:
+        return syscall_error(ENOSYS);
+#endif
+
+    default:
+        throw EmulatorError("unimplemented syscall " + std::to_string(number) + " (" + syscall_name(number) + ")");
+    }
+}
+
+}
