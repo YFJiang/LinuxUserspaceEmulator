@@ -574,6 +574,7 @@ void SoftCPU64::execute_group_ff(const Prefixes& prefixes)
     if (operation == 2) {
         auto target = read_operand(operand, 64, prefixes);
         push64(m_decode_pc);
+        m_call_stack.push_back(m_decode_pc);
         m_decode_pc = target;
         return;
     }
@@ -796,7 +797,12 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         u64 next_rip = m_decode_pc;
         m_gpr[RCX] = next_rip;
         m_gpr[R11] = m_rflags;
-        m_gpr[RAX] = m_emulator.handle_syscall(m_gpr[RAX]);
+        u64 result = m_emulator.handle_syscall(m_gpr[RAX]);
+        if (m_emulator.consume_restored_context_from_sigreturn()) {
+            m_decode_pc = m_rip;
+            break;
+        }
+        m_gpr[RAX] = result;
         m_decode_pc = next_rip;
         break;
     }
@@ -1483,11 +1489,17 @@ void SoftCPU64::step()
         break;
     case 0xc2: {
         u16 bytes = fetch16();
-        m_decode_pc = pop64() + bytes;
+        u64 target = pop64();
+        m_gpr[RSP] += bytes;
+        if (!m_call_stack.empty())
+            m_call_stack.pop_back();
+        m_decode_pc = target;
         break;
     }
     case 0xc3:
         m_decode_pc = pop64();
+        if (!m_call_stack.empty())
+            m_call_stack.pop_back();
         break;
     case 0xc6:
     case 0xc7: {
@@ -1523,6 +1535,7 @@ void SoftCPU64::step()
     case 0xe8: {
         i32 rel = fetch_i32();
         push64(m_decode_pc);
+        m_call_stack.push_back(m_decode_pc);
         m_decode_pc = m_decode_pc + rel;
         break;
     }

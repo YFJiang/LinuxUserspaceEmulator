@@ -4,6 +4,7 @@
 
 #include <array>
 #include <iosfwd>
+#include <vector>
 
 namespace LUE {
 
@@ -41,6 +42,7 @@ public:
     void set_reg(int reg, u64 value) { m_gpr[static_cast<size_t>(reg & 15)] = value; }
 
     u64 rflags() const { return m_rflags; }
+    void set_rflags(u64 value) { m_rflags = value; }
     void set_fs_base(u64 value) { m_fs_base = value; }
     void set_gs_base(u64 value) { m_gs_base = value; }
     u64 fs_base() const { return m_fs_base; }
@@ -50,6 +52,8 @@ public:
     void dump(std::ostream&) const;
     void trace_current_instruction(std::ostream&) const;
     std::string current_instruction_text() const;
+    const std::vector<u64>& call_stack() const { return m_call_stack; }
+    void push_synthetic_return(u64 return_address) { m_call_stack.push_back(return_address); }
 
 private:
     struct Prefixes {
@@ -151,6 +155,7 @@ private:
 
     u64 m_instruction_start { 0 };
     u64 m_decode_pc { 0 };
+    std::vector<u64> m_call_stack;
 };
 
 }

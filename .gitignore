@@ -1,0 +1,6 @@
+build/
+build-smoke/
+hello-static
+*.o
+tests/test_backtrace
+tests/test_signal

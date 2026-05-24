@@ -33,7 +33,14 @@ std::string find_executable(const std::string& command)
 
 void print_usage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " [--trace] [--trace-syscalls] <program> [args...]\n";
+    std::cerr << "Usage: " << argv0 << " [options] <program> [args...]\n"
+              << "\n"
+              << "Options:\n"
+              << "  -h, --help             Show this help text and exit\n"
+              << "      --trace            Print every guest instruction and registers\n"
+              << "      --trace-syscalls   Print guest Linux syscalls\n"
+              << "      --backtrace-on-exit\n"
+              << "                         Print a symbolic guest backtrace on normal exit\n";
 }
 
 }
@@ -44,12 +51,20 @@ int main(int argc, char** argv, char** envp)
     std::vector<std::string> guest_arguments;
 
     for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
         if (std::strcmp(argv[i], "--trace") == 0) {
             options.trace = true;
             continue;
         }
         if (std::strcmp(argv[i], "--trace-syscalls") == 0) {
             options.trace_syscalls = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--backtrace-on-exit") == 0) {
+            options.backtrace_on_exit = true;
             continue;
         }
         guest_arguments.emplace_back(argv[i]);

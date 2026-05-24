@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -216,6 +217,30 @@ const char* syscall_name(u64 number)
     case SYS_set_robust_list:
         return "set_robust_list";
 #endif
+#ifdef SYS_rt_sigreturn
+    case SYS_rt_sigreturn:
+        return "rt_sigreturn";
+#endif
+#ifdef SYS_rt_sigaction
+    case SYS_rt_sigaction:
+        return "rt_sigaction";
+#endif
+#ifdef SYS_rt_sigprocmask
+    case SYS_rt_sigprocmask:
+        return "rt_sigprocmask";
+#endif
+#ifdef SYS_kill
+    case SYS_kill:
+        return "kill";
+#endif
+#ifdef SYS_tkill
+    case SYS_tkill:
+        return "tkill";
+#endif
+#ifdef SYS_tgkill
+    case SYS_tgkill:
+        return "tgkill";
+#endif
 #ifdef SYS_rseq
     case SYS_rseq:
         return "rseq";
@@ -270,11 +295,19 @@ struct GuestRLimit64 {
     u64 rlim_max;
 };
 
+struct GuestSigAction {
+    u64 handler;
+    u64 flags;
+    u64 restorer;
+    u64 mask;
+};
+
 static_assert(sizeof(GuestTimespec) == 16);
 static_assert(sizeof(GuestIOVec) == 16);
 static_assert(sizeof(GuestStat) == 144);
 static_assert(sizeof(GuestUtsname) == 390);
 static_assert(sizeof(GuestRLimit64) == 16);
+static_assert(sizeof(GuestSigAction) == 32);
 
 GuestStat convert_stat(const struct stat& st)
 {
@@ -769,14 +802,73 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         return 0;
 #endif
 
+#ifdef SYS_rt_sigreturn
+    case SYS_rt_sigreturn:
+        return emulator.handle_sigreturn();
+#endif
+
 #ifdef SYS_rt_sigaction
-    case SYS_rt_sigaction:
+    case SYS_rt_sigaction: {
+        if (arg4 != 8)
+            return syscall_error(EINVAL);
+        GuestSigAction action {};
+        if (arg2)
+            mmu.copy_from_guest(&action, arg2, sizeof(action));
+        int rc = emulator.set_signal_action(static_cast<int>(arg1), arg2 != 0, action.handler, action.flags, action.restorer, action.mask, arg3);
+        if (rc < 0)
+            return static_cast<u64>(static_cast<i64>(rc));
         return 0;
+    }
 #endif
 
 #ifdef SYS_rt_sigprocmask
-    case SYS_rt_sigprocmask:
+    case SYS_rt_sigprocmask: {
+        if (arg4 != 8)
+            return syscall_error(EINVAL);
+        int rc = emulator.set_signal_mask(static_cast<int>(arg1), arg2, arg3);
+        if (rc < 0)
+            return static_cast<u64>(static_cast<i64>(rc));
         return 0;
+    }
+#endif
+
+#ifdef SYS_kill
+    case SYS_kill: {
+        if (arg1 != 0 && static_cast<pid_t>(arg1) != ::getpid())
+            return syscall_error(ESRCH);
+        if (arg2 == 0)
+            return 0;
+        int rc = emulator.deliver_signal(static_cast<int>(arg2));
+        if (rc < 0)
+            return static_cast<u64>(static_cast<i64>(rc));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_tkill
+    case SYS_tkill: {
+        if (static_cast<pid_t>(arg1) != static_cast<pid_t>(::syscall(SYS_gettid)))
+            return syscall_error(ESRCH);
+        if (arg2 == 0)
+            return 0;
+        int rc = emulator.deliver_signal(static_cast<int>(arg2));
+        if (rc < 0)
+            return static_cast<u64>(static_cast<i64>(rc));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_tgkill
+    case SYS_tgkill: {
+        if (static_cast<pid_t>(arg1) != ::getpid() || static_cast<pid_t>(arg2) != static_cast<pid_t>(::syscall(SYS_gettid)))
+            return syscall_error(ESRCH);
+        if (arg3 == 0)
+            return 0;
+        int rc = emulator.deliver_signal(static_cast<int>(arg3));
+        if (rc < 0)
+            return static_cast<u64>(static_cast<i64>(rc));
+        return 0;
+    }
 #endif
 
 #ifdef SYS_futex

@@ -14,6 +14,8 @@ cc -static -O0 -o /tmp/lue-hello-c "$repo_dir/tests/hello-c.c"
 cc -static -O0 -o /tmp/lue-args-env "$repo_dir/tests/args-env.c"
 cc -static -O0 -o /tmp/lue-cat-static "$repo_dir/tests/cat-static.c"
 cc -static -O0 -o /tmp/lue-mmap-brk "$repo_dir/tests/mmap-brk.c"
+cc -O0 -o /tmp/lue-signal-basic "$repo_dir/tests/signal-basic.c"
+cc -O0 -o /tmp/lue-host-signal "$repo_dir/tests/host-signal.c"
 cc -nostdlib -static -o /tmp/lue-fs-tls "$repo_dir/tests/fs-tls.S"
 
 emulator="$build_dir/LinuxUserspaceEmulator"
@@ -54,8 +56,84 @@ run_and_check_failure_contains() {
     printf 'PASS %s\n' "$name"
 }
 
+run_and_check_stdout_and_stderr_contains() {
+    local name="$1"
+    local expected_stdout="$2"
+    shift 2
+
+    local stdout_file stderr_file status stdout stderr
+    stdout_file="$(mktemp)"
+    stderr_file="$(mktemp)"
+    set +e
+    "$@" >"$stdout_file" 2>"$stderr_file"
+    status=$?
+    set -e
+    stdout="$(cat "$stdout_file")"
+    stderr="$(cat "$stderr_file")"
+    rm -f "$stdout_file" "$stderr_file"
+
+    if [[ "$status" != 0 || "$stdout" != "$expected_stdout" || "$stderr" != *"guest exit backtrace"* || "$stderr" != *"main+"* || "$stderr" != *"[libc.so.6]"* ]]; then
+        printf 'FAIL %s\nstatus: %s\nexpected stdout:\n%s\nactual stdout:\n%s\nactual stderr:\n%s\n' "$name" "$status" "$expected_stdout" "$stdout" "$stderr" >&2
+        return 1
+    fi
+    printf 'PASS %s\n' "$name"
+}
+
+run_and_check_contains() {
+    local name="$1"
+    local expected="$2"
+    shift 2
+
+    local output
+    output="$("$@" 2>&1)"
+    if [[ "$output" != *"$expected"* ]]; then
+        printf 'FAIL %s\nexpected output containing:\n%s\nactual output:\n%s\n' "$name" "$expected" "$output" >&2
+        return 1
+    fi
+    printf 'PASS %s\n' "$name"
+}
+
+run_and_check_host_signal() {
+    local name="$1"
+    local stdout_file stderr_file pid status output
+    stdout_file="$(mktemp)"
+    stderr_file="$(mktemp)"
+
+    "$emulator" /tmp/lue-host-signal >"$stdout_file" 2>"$stderr_file" &
+    pid=$!
+
+    for _ in {1..50}; do
+        if grep -q "ready" "$stdout_file"; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if ! grep -q "ready" "$stdout_file"; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        printf 'FAIL %s\nhost-signal guest did not become ready\nstderr:\n%s\n' "$name" "$(cat "$stderr_file")" >&2
+        rm -f "$stdout_file" "$stderr_file"
+        return 1
+    fi
+
+    kill -INT "$pid"
+    wait "$pid"
+    status=$?
+    output="$(cat "$stdout_file")"
+    if [[ "$status" != 0 || "$output" != $'ready\nhandled' ]]; then
+        printf 'FAIL %s\nstatus: %s\nexpected stdout:\n%s\nactual stdout:\n%s\nstderr:\n%s\n' "$name" "$status" $'ready\nhandled' "$output" "$(cat "$stderr_file")" >&2
+        rm -f "$stdout_file" "$stderr_file"
+        return 1
+    fi
+    rm -f "$stdout_file" "$stderr_file"
+    printf 'PASS %s\n' "$name"
+}
+
+run_and_check_contains help "--backtrace-on-exit" "$emulator" --help
 run_and_check hello-static "hello from guest" "$emulator" /tmp/lue-hello-static
 run_and_check hello-dyn "hello from C guest" "$emulator" /tmp/lue-hello-dyn
+run_and_check_stdout_and_stderr_contains hello-dyn-exit-backtrace "hello from C guest" "$emulator" --backtrace-on-exit /tmp/lue-hello-dyn
 run_and_check_failure_contains symbol-backtrace "$emulator" /tmp/lue-symbol-backtrace
 run_and_check hello-c "hello from C guest" "$emulator" /tmp/lue-hello-c
 
@@ -66,4 +144,6 @@ printf 'cat input\n' >/tmp/lue-cat-input
 run_and_check cat-static "cat input" "$emulator" /tmp/lue-cat-static /tmp/lue-cat-input
 
 run_and_check mmap-brk $'heap ok\nmmap ok' "$emulator" /tmp/lue-mmap-brk
+run_and_check signal-basic $'before\nhandled\nafter' "$emulator" /tmp/lue-signal-basic
+run_and_check_host_signal host-signal
 run_and_check fs-tls "fs ok" "$emulator" /tmp/lue-fs-tls

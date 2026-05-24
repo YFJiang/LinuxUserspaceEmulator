@@ -11,6 +11,8 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <signal.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -36,6 +38,21 @@ static constexpr u64 AT_SECURE = 23;
 static constexpr u64 AT_RANDOM = 25;
 static constexpr u64 AT_HWCAP2 = 26;
 static constexpr u64 AT_EXECFN = 31;
+
+static constexpr u64 signal_frame_magic = 0x4c55455349474652ULL; // "LUESIGFR"
+static constexpr u64 signal_trampoline_address = 0x7fffff100000ULL;
+static constexpr u64 signal_frame_size = 8 * (1 + 1 + 1 + 1 + 16 + 1 + 1);
+static volatile sig_atomic_t s_host_signal_pending[NSIG] {};
+
+enum SignalFrameOffset : u64 {
+    SignalFrameMagic = 0,
+    SignalFrameMask = 8,
+    SignalFrameRip = 16,
+    SignalFrameRflags = 24,
+    SignalFrameGpr = 32,
+    SignalFrameFsBase = SignalFrameGpr + 16 * 8,
+    SignalFrameGsBase = SignalFrameFsBase + 8,
+};
 
 std::string basename(const std::string& path)
 {
@@ -69,6 +86,37 @@ std::optional<std::string> path_from_host_fd(int fd)
     return std::string(path.data());
 }
 
+bool is_exit_syscall(u64 number)
+{
+#ifdef SYS_exit
+    if (number == SYS_exit)
+        return true;
+#endif
+#ifdef SYS_exit_group
+    if (number == SYS_exit_group)
+        return true;
+#endif
+    return false;
+}
+
+u64 signal_bit(int signum)
+{
+    if (signum <= 0 || signum >= 64)
+        return 0;
+    return 1ULL << (signum - 1);
+}
+
+bool default_signal_is_ignored(int signum)
+{
+    return signum == SIGCHLD || signum == SIGURG || signum == SIGWINCH;
+}
+
+void host_signal_handler(int signum)
+{
+    if (signum > 0 && signum < NSIG)
+        s_host_signal_pending[signum] = 1;
+}
+
 }
 
 Emulator::Emulator(std::string executable_path, std::vector<std::string> arguments, std::vector<std::string> environment, EmulatorOptions options)
@@ -93,8 +141,19 @@ int Emulator::exec()
             } else {
                 m_cpu.step();
             }
+            collect_host_signals();
+            dispatch_pending_signal();
         }
     } catch (const GuestExit& exit) {
+        if (m_options.backtrace_on_exit) {
+            if (!m_last_non_exit_syscall_backtrace.empty()) {
+                std::cerr << "guest exit backtrace (last non-exit syscall):\n";
+                dump_backtrace(m_last_non_exit_syscall_backtrace);
+            } else {
+                std::cerr << "guest exit backtrace:\n";
+                dump_backtrace();
+            }
+        }
         return exit.status();
     } catch (const EmulatorError& error) {
         std::cerr << "\nLinuxUserspaceEmulator: " << error.what() << "\n";
@@ -109,6 +168,8 @@ void Emulator::load()
     register_loaded_image(m_program.executable_path, m_program.executable_base, "executable");
     if (m_program.dynamic && !m_program.interpreter_path.empty())
         register_loaded_image(m_program.interpreter_path, m_program.interpreter_base, "loader");
+    setup_signal_trampoline();
+    register_host_signal_handlers();
 
     m_brk_start = page_align_up(m_program.brk_start);
     m_brk = m_brk_start;
@@ -220,7 +281,187 @@ u64 Emulator::set_brk(u64 requested)
 
 u64 Emulator::handle_syscall(u64 number)
 {
+    if (m_options.backtrace_on_exit && !is_exit_syscall(number))
+        m_last_non_exit_syscall_backtrace = raw_backtrace();
     return LinuxSyscalls::dispatch(*this, number);
+}
+
+void Emulator::setup_signal_trampoline()
+{
+    static constexpr std::array<u8, 11> trampoline {
+        0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov $15, %rax
+        0x0f, 0x05,                               // syscall
+        0xf4,                                     // hlt
+        0x90,                                     // nop
+    };
+    m_mmu.map_bytes(signal_trampoline_address, page_size, ProtRead | ProtExecute, trampoline.data(), trampoline.size(), 0, "[signal trampoline]");
+    m_signal_trampoline = signal_trampoline_address;
+}
+
+void Emulator::register_host_signal_handlers()
+{
+    auto register_one = [](int signum) {
+        struct sigaction action {};
+        action.sa_handler = host_signal_handler;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = 0;
+        sigaction(signum, &action, nullptr);
+    };
+
+    register_one(SIGHUP);
+    register_one(SIGINT);
+    register_one(SIGQUIT);
+    register_one(SIGTERM);
+    register_one(SIGUSR1);
+    register_one(SIGUSR2);
+    register_one(SIGALRM);
+}
+
+void Emulator::collect_host_signals()
+{
+    for (int signum = 1; signum < NSIG && signum < 64; ++signum) {
+        if (!s_host_signal_pending[signum])
+            continue;
+        s_host_signal_pending[signum] = 0;
+        deliver_signal(signum);
+    }
+}
+
+bool Emulator::is_signal_blocked(int signum) const
+{
+    return (m_signal_mask & signal_bit(signum)) != 0;
+}
+
+void Emulator::dispatch_pending_signal()
+{
+    for (int signum = 1; signum < NSIG && signum < 64; ++signum) {
+        auto bit = signal_bit(signum);
+        if (!(m_pending_signals & bit) || is_signal_blocked(signum))
+            continue;
+
+        m_pending_signals &= ~bit;
+        auto const& action = m_signal_actions[static_cast<size_t>(signum)];
+
+        if (action.handler == 1)
+            return;
+        if (action.handler == 0) {
+            if (default_signal_is_ignored(signum))
+                return;
+            throw GuestExit(128 + signum);
+        }
+
+        u64 old_rsp = m_cpu.reg(SoftCPU64::RSP);
+        u64 frame = (old_rsp - signal_frame_size - 128) & ~0xfULL;
+        u64 handler_rsp = frame - 8;
+        u64 restorer = action.restorer ? action.restorer : m_signal_trampoline;
+
+        m_mmu.write64(handler_rsp, restorer);
+        m_mmu.write64(frame + SignalFrameMagic, signal_frame_magic);
+        m_mmu.write64(frame + SignalFrameMask, m_signal_mask);
+        m_mmu.write64(frame + SignalFrameRip, m_cpu.rip());
+        m_mmu.write64(frame + SignalFrameRflags, m_cpu.rflags());
+        for (int i = 0; i < 16; ++i)
+            m_mmu.write64(frame + SignalFrameGpr + static_cast<u64>(i) * 8, m_cpu.reg(i));
+        m_mmu.write64(frame + SignalFrameFsBase, m_cpu.fs_base());
+        m_mmu.write64(frame + SignalFrameGsBase, m_cpu.gs_base());
+
+        m_signal_mask |= action.mask;
+        m_signal_mask |= bit;
+
+        m_cpu.set_reg(SoftCPU64::RDI, static_cast<u64>(signum));
+        m_cpu.set_reg(SoftCPU64::RSI, 0);
+        m_cpu.set_reg(SoftCPU64::RDX, 0);
+        m_cpu.set_reg(SoftCPU64::RSP, handler_rsp);
+        m_cpu.set_rip(action.handler);
+        m_cpu.push_synthetic_return(restorer);
+        return;
+    }
+}
+
+int Emulator::set_signal_action(int signum, bool update_action, u64 handler, u64 flags, u64 restorer, u64 mask, u64 old_action_address)
+{
+    if (signum <= 0 || signum >= NSIG || signum >= 64)
+        return -EINVAL;
+    if (signum == SIGKILL || signum == SIGSTOP)
+        return -EINVAL;
+
+    if (old_action_address) {
+        auto const& old_action = m_signal_actions[static_cast<size_t>(signum)];
+        m_mmu.write64(old_action_address + 0, old_action.handler);
+        m_mmu.write64(old_action_address + 8, old_action.flags);
+        m_mmu.write64(old_action_address + 16, old_action.restorer);
+        m_mmu.write64(old_action_address + 24, old_action.mask);
+    }
+
+    if (update_action)
+        m_signal_actions[static_cast<size_t>(signum)] = { handler, flags, restorer, mask };
+    return 0;
+}
+
+int Emulator::set_signal_mask(int how, u64 set_address, u64 old_set_address)
+{
+    if (old_set_address)
+        m_mmu.write64(old_set_address, m_signal_mask);
+    if (!set_address)
+        return 0;
+
+    u64 new_mask = m_mmu.read64(set_address);
+    new_mask &= ~signal_bit(SIGKILL);
+    new_mask &= ~signal_bit(SIGSTOP);
+
+    switch (how) {
+    case 0:
+        m_signal_mask |= new_mask;
+        return 0;
+    case 1:
+        m_signal_mask &= ~new_mask;
+        return 0;
+    case 2:
+        m_signal_mask = new_mask;
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+int Emulator::deliver_signal(int signum)
+{
+    if (signum <= 0 || signum >= NSIG || signum >= 64)
+        return -EINVAL;
+    m_pending_signals |= signal_bit(signum);
+    return 0;
+}
+
+u64 Emulator::handle_sigreturn()
+{
+    u64 frame = m_cpu.reg(SoftCPU64::RSP);
+    if (m_mmu.read64(frame + SignalFrameMagic) != signal_frame_magic)
+        throw EmulatorError("invalid guest signal frame at " + hex(frame));
+
+    m_signal_mask = m_mmu.read64(frame + SignalFrameMask);
+    u64 restored_rip = m_mmu.read64(frame + SignalFrameRip);
+    u64 restored_rflags = m_mmu.read64(frame + SignalFrameRflags);
+    std::array<u64, 16> restored_regs {};
+    for (int i = 0; i < 16; ++i)
+        restored_regs[static_cast<size_t>(i)] = m_mmu.read64(frame + SignalFrameGpr + static_cast<u64>(i) * 8);
+    u64 restored_fs = m_mmu.read64(frame + SignalFrameFsBase);
+    u64 restored_gs = m_mmu.read64(frame + SignalFrameGsBase);
+
+    for (int i = 0; i < 16; ++i)
+        m_cpu.set_reg(i, restored_regs[static_cast<size_t>(i)]);
+    m_cpu.set_fs_base(restored_fs);
+    m_cpu.set_gs_base(restored_gs);
+    m_cpu.set_rflags(restored_rflags);
+    m_cpu.set_rip(restored_rip);
+    m_restored_context_from_sigreturn = true;
+    return restored_regs[SoftCPU64::RAX];
+}
+
+bool Emulator::consume_restored_context_from_sigreturn()
+{
+    bool value = m_restored_context_from_sigreturn;
+    m_restored_context_from_sigreturn = false;
+    return value;
 }
 
 bool Emulator::LoadedImage::contains_code(u64 address) const
@@ -358,6 +599,15 @@ std::vector<u64> Emulator::raw_backtrace() const
     std::vector<u64> backtrace;
     backtrace.push_back(m_cpu.rip());
 
+    auto append_address = [&](u64 address) {
+        if (address && std::find(backtrace.begin(), backtrace.end(), address) == backtrace.end())
+            backtrace.push_back(address);
+    };
+
+    auto const& call_stack = m_cpu.call_stack();
+    for (auto it = call_stack.rbegin(); it != call_stack.rend() && backtrace.size() < 128; ++it)
+        append_address(*it);
+
     u64 frame = m_cpu.reg(SoftCPU64::RBP);
     for (size_t depth = 0; depth < 127 && frame; ++depth) {
         if (!m_mmu.is_mapped(frame, 16))
@@ -366,7 +616,7 @@ std::vector<u64> Emulator::raw_backtrace() const
         u64 return_address = m_mmu.read64(frame + 8);
         if (!return_address)
             break;
-        backtrace.push_back(return_address);
+        append_address(return_address);
         if (next_frame <= frame)
             break;
         frame = next_frame;

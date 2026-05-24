@@ -3,8 +3,10 @@
 #include "ELFLoader.h"
 #include "SoftCPU64.h"
 
+#include <array>
 #include <map>
 #include <optional>
+#include <signal.h>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,7 @@ namespace LUE {
 struct EmulatorOptions {
     bool trace { false };
     bool trace_syscalls { false };
+    bool backtrace_on_exit { false };
 };
 
 class Emulator {
@@ -21,6 +24,8 @@ public:
 
     int exec();
     u64 handle_syscall(u64 number);
+    u64 handle_sigreturn();
+    bool consume_restored_context_from_sigreturn();
 
     SoftMMU& mmu() { return m_mmu; }
     const SoftMMU& mmu() const { return m_mmu; }
@@ -46,6 +51,10 @@ public:
     bool is_in_libc() const;
     bool is_in_libsystem() const;
     bool is_in_malloc_or_free() const;
+
+    int set_signal_action(int signum, bool update_action, u64 handler, u64 flags, u64 restorer, u64 mask, u64 old_action_address);
+    int set_signal_mask(int how, u64 set_address, u64 old_set_address);
+    int deliver_signal(int signum);
 
     void dump_state() const;
 
@@ -77,6 +86,11 @@ private:
     u64 push_bytes(const void* data, size_t size);
     u64 push_string(const std::string& value);
     void register_loaded_image(const std::string& path, u64 load_base, std::string kind = {});
+    void setup_signal_trampoline();
+    void register_host_signal_handlers();
+    void collect_host_signals();
+    void dispatch_pending_signal();
+    bool is_signal_blocked(int signum) const;
     const LoadedImage* image_containing(u64 address) const;
     const SymbolRange* symbol_containing(const LoadedImage&, u64 address) const;
     std::string describe_address(u64 address) const;
@@ -101,6 +115,18 @@ private:
 
     std::map<int, std::string> m_fd_paths;
     std::vector<LoadedImage> m_loaded_images;
+    std::vector<u64> m_last_non_exit_syscall_backtrace;
+    u64 m_signal_trampoline { 0 };
+    u64 m_pending_signals { 0 };
+    u64 m_signal_mask { 0 };
+    struct SignalAction {
+        u64 handler { 0 };
+        u64 flags { 0 };
+        u64 restorer { 0 };
+        u64 mask { 0 };
+    };
+    std::array<SignalAction, NSIG> m_signal_actions {};
+    bool m_restored_context_from_sigreturn { false };
     SymbolRange m_malloc_symbol;
     SymbolRange m_realloc_symbol;
     SymbolRange m_calloc_symbol;

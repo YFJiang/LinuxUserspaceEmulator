@@ -1,3 +1,0 @@
-/home/johnson/Workspace/LinuxUserspaceEmulator/build-smoke/CMakeFiles/LinuxUserspaceEmulator.dir
-/home/johnson/Workspace/LinuxUserspaceEmulator/build-smoke/CMakeFiles/edit_cache.dir
-/home/johnson/Workspace/LinuxUserspaceEmulator/build-smoke/CMakeFiles/rebuild_cache.dir
