@@ -7,3 +7,4 @@ hello-static
 tests/test_backtrace
 tests/test_signal
 tests/syscall-coverage
+tests/region-types

@@ -870,9 +870,9 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
             if (fixed_noreplace && guest_range_is_mapped(mmu, address, size))
                 return syscall_error(EEXIST);
             mmu.unmap(address, size);
-            mmu.map_zeroed(address, size, ProtRead | ProtWrite, mapping_name);
+            mmu.map_mmap(address, size, ProtRead | ProtWrite, mapping_name, mapped_path, arg6);
         } else {
-            address = mmu.allocate(size, page_size, ProtRead | ProtWrite, mapping_name);
+            address = mmu.allocate_mmap(size, page_size, ProtRead | ProtWrite, mapping_name, mapped_path, arg6);
         }
 
         if (!anonymous) {

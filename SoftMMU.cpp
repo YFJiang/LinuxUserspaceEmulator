@@ -3,13 +3,88 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <utility>
 
 namespace LUE {
 
+SoftMMU::Region::Region(u64 base, u64 size, int prot, std::string name)
+    : base(base)
+    , size(size)
+    , prot(prot)
+    , name(std::move(name))
+{
+}
+
+SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string name)
+    : Region(base, size, prot, std::move(name))
+    , m_bytes(size)
+{
+}
+
+SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string name, std::vector<u8> bytes)
+    : Region(base, size, prot, std::move(name))
+    , m_bytes(std::move(bytes))
+{
+    if (m_bytes.size() != size)
+        throw EmulatorError("simple region byte size mismatch");
+}
+
+u8 SoftMMU::SimpleRegion::read_offset(u64 offset) const
+{
+    return m_bytes.at(static_cast<size_t>(offset));
+}
+
+void SoftMMU::SimpleRegion::write_offset(u64 offset, u8 value)
+{
+    m_bytes.at(static_cast<size_t>(offset)) = value;
+}
+
+std::unique_ptr<SoftMMU::Region> SoftMMU::SimpleRegion::clone_slice(u64 new_base, u64 offset, u64 new_size) const
+{
+    auto begin = m_bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+    auto end = begin + static_cast<std::ptrdiff_t>(new_size);
+    return std::make_unique<SimpleRegion>(new_base, new_size, prot, name, std::vector<u8>(begin, end));
+}
+
+SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
+    : Region(base, size, prot, std::move(name))
+    , m_path(std::move(path))
+    , m_file_offset(file_offset)
+    , m_bytes(size)
+{
+}
+
+SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset, std::vector<u8> bytes)
+    : Region(base, size, prot, std::move(name))
+    , m_path(std::move(path))
+    , m_file_offset(file_offset)
+    , m_bytes(std::move(bytes))
+{
+    if (m_bytes.size() != size)
+        throw EmulatorError("mmap region byte size mismatch");
+}
+
+u8 SoftMMU::MmapRegion::read_offset(u64 offset) const
+{
+    return m_bytes.at(static_cast<size_t>(offset));
+}
+
+void SoftMMU::MmapRegion::write_offset(u64 offset, u8 value)
+{
+    m_bytes.at(static_cast<size_t>(offset)) = value;
+}
+
+std::unique_ptr<SoftMMU::Region> SoftMMU::MmapRegion::clone_slice(u64 new_base, u64 offset, u64 new_size) const
+{
+    auto begin = m_bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+    auto end = begin + static_cast<std::ptrdiff_t>(new_size);
+    return std::make_unique<MmapRegion>(new_base, new_size, prot, name, m_path, m_file_offset + offset, std::vector<u8>(begin, end));
+}
+
 void SoftMMU::sort_regions()
 {
-    std::sort(m_regions.begin(), m_regions.end(), [](const Region& a, const Region& b) {
-        return a.base < b.base;
+    std::sort(m_regions.begin(), m_regions.end(), [](const auto& a, const auto& b) {
+        return a->base < b->base;
     });
 }
 
@@ -22,8 +97,8 @@ void SoftMMU::ensure_no_overlap(u64 base, u64 size) const
         throw EmulatorError("mapping overflow");
 
     for (auto const& region : m_regions) {
-        if (base < region.end() && end > region.base)
-            throw EmulatorError("mapping " + hex(base) + "-" + hex(end) + " overlaps " + hex(region.base) + "-" + hex(region.end()) + " (" + region.name + ")");
+        if (base < region->end() && end > region->base)
+            throw EmulatorError("mapping " + hex(base) + "-" + hex(end) + " overlaps " + hex(region->base) + "-" + hex(region->end()) + " (" + region->name + ")");
     }
 }
 
@@ -32,13 +107,7 @@ void SoftMMU::map_zeroed(u64 base, u64 size, int prot, std::string name)
     base = page_align_down(base);
     size = page_align_up(size);
     ensure_no_overlap(base, size);
-    Region region;
-    region.base = base;
-    region.size = size;
-    region.prot = prot;
-    region.name = std::move(name);
-    region.bytes.resize(size);
-    m_regions.push_back(std::move(region));
+    m_regions.push_back(std::make_unique<SimpleRegion>(base, size, prot, std::move(name)));
     sort_regions();
 }
 
@@ -50,15 +119,19 @@ void SoftMMU::map_bytes(u64 base, u64 size, int prot, const u8* source, size_t s
     if (destination_offset > size || source_size > size - destination_offset)
         throw EmulatorError("file mapping copy exceeds destination region");
 
-    Region region;
-    region.base = base;
-    region.size = size;
-    region.prot = prot;
-    region.name = std::move(name);
-    region.bytes.resize(size);
+    std::vector<u8> bytes(size);
     if (source_size)
-        std::memcpy(region.bytes.data() + destination_offset, source, source_size);
-    m_regions.push_back(std::move(region));
+        std::memcpy(bytes.data() + destination_offset, source, source_size);
+    m_regions.push_back(std::make_unique<SimpleRegion>(base, size, prot, std::move(name), std::move(bytes)));
+    sort_regions();
+}
+
+void SoftMMU::map_mmap(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
+{
+    base = page_align_down(base);
+    size = page_align_up(size);
+    ensure_no_overlap(base, size);
+    m_regions.push_back(std::make_unique<MmapRegion>(base, size, prot, std::move(name), std::move(path), file_offset));
     sort_regions();
 }
 
@@ -71,8 +144,8 @@ u64 SoftMMU::allocate(u64 size, u64 alignment, int prot, std::string name)
         u64 candidate = (m_next_allocation + alignment - 1) & ~(alignment - 1);
         bool collided = false;
         for (auto const& region : m_regions) {
-            if (candidate < region.end() && candidate + size > region.base) {
-                m_next_allocation = page_align_up(region.end());
+            if (candidate < region->end() && candidate + size > region->base) {
+                m_next_allocation = page_align_up(region->end());
                 collided = true;
                 break;
             }
@@ -85,48 +158,51 @@ u64 SoftMMU::allocate(u64 size, u64 alignment, int prot, std::string name)
     }
 }
 
+u64 SoftMMU::allocate_mmap(u64 size, u64 alignment, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
+{
+    size = page_align_up(size);
+    alignment = std::max<u64>(page_size, alignment);
+
+    for (;;) {
+        u64 candidate = (m_next_allocation + alignment - 1) & ~(alignment - 1);
+        bool collided = false;
+        for (auto const& region : m_regions) {
+            if (candidate < region->end() && candidate + size > region->base) {
+                m_next_allocation = page_align_up(region->end());
+                collided = true;
+                break;
+            }
+        }
+        if (!collided) {
+            map_mmap(candidate, size, prot, std::move(name), std::move(path), file_offset);
+            m_next_allocation = candidate + size;
+            return candidate;
+        }
+    }
+}
+
 void SoftMMU::split_around(u64 base, u64 size)
 {
     u64 end = base + size;
-    std::vector<Region> rebuilt;
+    std::vector<std::unique_ptr<Region>> rebuilt;
     rebuilt.reserve(m_regions.size() + 4);
 
     for (auto& region : m_regions) {
-        if (end <= region.base || base >= region.end()) {
+        if (end <= region->base || base >= region->end()) {
             rebuilt.push_back(std::move(region));
             continue;
         }
 
-        if (base > region.base) {
-            Region left;
-            left.base = region.base;
-            left.size = base - region.base;
-            left.prot = region.prot;
-            left.name = region.name;
-            left.bytes.assign(region.bytes.begin(), region.bytes.begin() + static_cast<std::ptrdiff_t>(left.size));
-            rebuilt.push_back(std::move(left));
+        if (base > region->base) {
+            rebuilt.push_back(region->clone_slice(region->base, 0, base - region->base));
         }
 
-        u64 overlap_start = std::max(base, region.base);
-        u64 overlap_end = std::min(end, region.end());
-        Region middle;
-        middle.base = overlap_start;
-        middle.size = overlap_end - overlap_start;
-        middle.prot = region.prot;
-        middle.name = region.name;
-        auto middle_begin = region.bytes.begin() + static_cast<std::ptrdiff_t>(overlap_start - region.base);
-        middle.bytes.assign(middle_begin, middle_begin + static_cast<std::ptrdiff_t>(middle.size));
-        rebuilt.push_back(std::move(middle));
+        u64 overlap_start = std::max(base, region->base);
+        u64 overlap_end = std::min(end, region->end());
+        rebuilt.push_back(region->clone_slice(overlap_start, overlap_start - region->base, overlap_end - overlap_start));
 
-        if (end < region.end()) {
-            Region right;
-            right.base = end;
-            right.size = region.end() - end;
-            right.prot = region.prot;
-            right.name = region.name;
-            auto right_begin = region.bytes.begin() + static_cast<std::ptrdiff_t>(end - region.base);
-            right.bytes.assign(right_begin, region.bytes.end());
-            rebuilt.push_back(std::move(right));
+        if (end < region->end()) {
+            rebuilt.push_back(region->clone_slice(end, end - region->base, region->end() - end));
         }
     }
 
@@ -142,8 +218,8 @@ void SoftMMU::unmap(u64 base, u64 size)
     size = page_align_up(size);
     split_around(base, size);
     u64 end = base + size;
-    m_regions.erase(std::remove_if(m_regions.begin(), m_regions.end(), [&](const Region& region) {
-        return region.base >= base && region.end() <= end;
+    m_regions.erase(std::remove_if(m_regions.begin(), m_regions.end(), [&](const auto& region) {
+        return region->base >= base && region->end() <= end;
     }), m_regions.end());
 }
 
@@ -156,8 +232,8 @@ void SoftMMU::protect(u64 base, u64 size, int prot)
     split_around(base, size);
     u64 end = base + size;
     for (auto& region : m_regions) {
-        if (region.base >= base && region.end() <= end)
-            region.prot = prot;
+        if (region->base >= base && region->end() <= end)
+            region->prot = prot;
     }
 }
 
@@ -173,8 +249,8 @@ bool SoftMMU::is_mapped(u64 address, size_t size) const
 const SoftMMU::Region* SoftMMU::find_region(u64 address) const
 {
     for (auto const& region : m_regions) {
-        if (region.contains(address))
-            return &region;
+        if (region->contains(address))
+            return region.get();
     }
     return nullptr;
 }
@@ -182,8 +258,8 @@ const SoftMMU::Region* SoftMMU::find_region(u64 address) const
 SoftMMU::Region* SoftMMU::find_region(u64 address)
 {
     for (auto& region : m_regions) {
-        if (region.contains(address))
-            return &region;
+        if (region->contains(address))
+            return region.get();
     }
     return nullptr;
 }
@@ -211,7 +287,7 @@ SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot)
 u8 SoftMMU::read8(u64 address) const
 {
     auto const& region = region_for(address, ProtRead);
-    return region.bytes.at(static_cast<size_t>(address - region.base));
+    return region.read_offset(address - region.base);
 }
 
 u16 SoftMMU::read16(u64 address) const
@@ -241,7 +317,7 @@ u64 SoftMMU::read64(u64 address) const
 void SoftMMU::write8(u64 address, u8 value)
 {
     auto& region = region_for(address, ProtWrite);
-    region.bytes.at(static_cast<size_t>(address - region.base)) = value;
+    region.write_offset(address - region.base, value);
 }
 
 void SoftMMU::write16(u64 address, u16 value)
@@ -299,11 +375,11 @@ std::string SoftMMU::read_c_string(u64 address, size_t limit) const
 void SoftMMU::dump_regions(std::ostream& stream) const
 {
     for (auto const& region : m_regions) {
-        stream << hex(region.base, 12) << "-" << hex(region.end(), 12) << " "
-               << (region.readable() ? 'r' : '-')
-               << (region.writable() ? 'w' : '-')
-               << (region.executable() ? 'x' : '-')
-               << " " << region.name << "\n";
+        stream << hex(region->base, 12) << "-" << hex(region->end(), 12) << " "
+               << (region->readable() ? 'r' : '-')
+               << (region->writable() ? 'w' : '-')
+               << (region->executable() ? 'x' : '-')
+               << " " << region->kind() << " " << region->name << "\n";
     }
 }
 
