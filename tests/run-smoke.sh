@@ -17,6 +17,7 @@ cc -static -O0 -o /tmp/lue-mmap-brk "$repo_dir/tests/mmap-brk.c"
 cc -static -O0 -o /tmp/lue-syscall-coverage "$repo_dir/tests/syscall-coverage.c"
 cc -static -O0 -o /tmp/lue-region-types "$repo_dir/tests/region-types.c"
 cc -static -O0 -o /tmp/lue-region-dump "$repo_dir/tests/region-dump.c"
+cc -static -O0 -o /tmp/lue-shadow-memory "$repo_dir/tests/shadow-memory.c"
 cc -O0 -o /tmp/lue-signal-basic "$repo_dir/tests/signal-basic.c"
 cc -O0 -o /tmp/lue-host-signal "$repo_dir/tests/host-signal.c"
 cc -nostdlib -static -o /tmp/lue-fs-tls "$repo_dir/tests/fs-tls.S"
@@ -168,6 +169,7 @@ run_and_check mmap-brk $'heap ok\nmmap ok' "$emulator" /tmp/lue-mmap-brk
 run_and_check syscall-coverage "syscall coverage ok" "$emulator" /tmp/lue-syscall-coverage
 run_and_check region-types $'LEft\nRIght' "$emulator" /tmp/lue-region-types
 run_and_check_failure_output_contains region-dump "mmap [mmap]" "$emulator" /tmp/lue-region-dump
+run_and_check_failure_output_contains shadow-memory "uninitialized guest memory read" "$emulator" /tmp/lue-shadow-memory
 run_and_check signal-basic $'before\nhandled\nafter' "$emulator" /tmp/lue-signal-basic
 run_and_check_host_signal host-signal
 run_and_check fs-tls "fs ok" "$emulator" /tmp/lue-fs-tls

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Types.h"
+#include "ValueWithShadow.h"
 
 #include <iosfwd>
 #include <memory>
@@ -36,7 +37,10 @@ public:
 
         virtual const char* kind() const = 0;
         virtual u8 read_offset(u64 offset) const = 0;
-        virtual void write_offset(u64 offset, u8 value) = 0;
+        virtual ValueWithShadow<u8> read_offset_with_shadow(u64 offset) const = 0;
+        virtual void write_offset(u64 offset, u8 value, bool initialized) = 0;
+        virtual bool is_offset_initialized(u64 offset) const = 0;
+        virtual void set_offset_initialized(u64 offset, bool initialized) = 0;
         virtual std::unique_ptr<Region> clone_slice(u64 new_base, u64 offset, u64 new_size) const = 0;
     };
 
@@ -47,11 +51,15 @@ public:
 
         const char* kind() const override { return "simple"; }
         u8 read_offset(u64 offset) const override;
-        void write_offset(u64 offset, u8 value) override;
+        ValueWithShadow<u8> read_offset_with_shadow(u64 offset) const override;
+        void write_offset(u64 offset, u8 value, bool initialized) override;
+        bool is_offset_initialized(u64 offset) const override;
+        void set_offset_initialized(u64 offset, bool initialized) override;
         std::unique_ptr<Region> clone_slice(u64 new_base, u64 offset, u64 new_size) const override;
 
     private:
         std::vector<u8> m_bytes;
+        std::vector<u8> m_initialized;
     };
 
     class MmapRegion final : public Region {
@@ -63,13 +71,17 @@ public:
         const std::optional<std::string>& path() const { return m_path; }
         u64 file_offset() const { return m_file_offset; }
         u8 read_offset(u64 offset) const override;
-        void write_offset(u64 offset, u8 value) override;
+        ValueWithShadow<u8> read_offset_with_shadow(u64 offset) const override;
+        void write_offset(u64 offset, u8 value, bool initialized) override;
+        bool is_offset_initialized(u64 offset) const override;
+        void set_offset_initialized(u64 offset, bool initialized) override;
         std::unique_ptr<Region> clone_slice(u64 new_base, u64 offset, u64 new_size) const override;
 
     private:
         std::optional<std::string> m_path;
         u64 m_file_offset { 0 };
         std::vector<u8> m_bytes;
+        std::vector<u8> m_initialized;
     };
 
     void map_zeroed(u64 base, u64 size, int prot, std::string name);
@@ -85,13 +97,16 @@ public:
     Region* find_region(u64 address);
 
     u8 read8(u64 address) const;
+    ValueWithShadow<u8> read8_with_shadow(u64 address) const;
     u16 read16(u64 address) const;
     u32 read32(u64 address) const;
     u64 read64(u64 address) const;
     void write8(u64 address, u8 value);
+    void write8_with_shadow(u64 address, ValueWithShadow<u8> value);
     void write16(u64 address, u16 value);
     void write32(u64 address, u32 value);
     void write64(u64 address, u64 value);
+    void mark_initialized(u64 address, size_t size, bool initialized);
 
     void copy_from_guest(void* destination, u64 source, size_t size) const;
     void copy_to_guest(u64 destination, const void* source, size_t size);

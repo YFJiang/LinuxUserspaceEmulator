@@ -18,12 +18,14 @@ SoftMMU::Region::Region(u64 base, u64 size, int prot, std::string name)
 SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string name)
     : Region(base, size, prot, std::move(name))
     , m_bytes(size)
+    , m_initialized(size, 1)
 {
 }
 
 SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string name, std::vector<u8> bytes)
     : Region(base, size, prot, std::move(name))
     , m_bytes(std::move(bytes))
+    , m_initialized(size, 1)
 {
     if (m_bytes.size() != size)
         throw EmulatorError("simple region byte size mismatch");
@@ -34,16 +36,38 @@ u8 SoftMMU::SimpleRegion::read_offset(u64 offset) const
     return m_bytes.at(static_cast<size_t>(offset));
 }
 
-void SoftMMU::SimpleRegion::write_offset(u64 offset, u8 value)
+ValueWithShadow<u8> SoftMMU::SimpleRegion::read_offset_with_shadow(u64 offset) const
+{
+    auto value = read_offset(offset);
+    return is_offset_initialized(offset) ? ValueWithShadow<u8>::initialized(value) : ValueWithShadow<u8>::uninitialized(value);
+}
+
+void SoftMMU::SimpleRegion::write_offset(u64 offset, u8 value, bool initialized)
 {
     m_bytes.at(static_cast<size_t>(offset)) = value;
+    set_offset_initialized(offset, initialized);
+}
+
+bool SoftMMU::SimpleRegion::is_offset_initialized(u64 offset) const
+{
+    return m_initialized.at(static_cast<size_t>(offset)) != 0;
+}
+
+void SoftMMU::SimpleRegion::set_offset_initialized(u64 offset, bool initialized)
+{
+    m_initialized.at(static_cast<size_t>(offset)) = initialized ? 1 : 0;
 }
 
 std::unique_ptr<SoftMMU::Region> SoftMMU::SimpleRegion::clone_slice(u64 new_base, u64 offset, u64 new_size) const
 {
     auto begin = m_bytes.begin() + static_cast<std::ptrdiff_t>(offset);
     auto end = begin + static_cast<std::ptrdiff_t>(new_size);
-    return std::make_unique<SimpleRegion>(new_base, new_size, prot, name, std::vector<u8>(begin, end));
+    auto clone = std::make_unique<SimpleRegion>(new_base, new_size, prot, name, std::vector<u8>(begin, end));
+    auto shadow_begin = m_initialized.begin() + static_cast<std::ptrdiff_t>(offset);
+    auto shadow_end = shadow_begin + static_cast<std::ptrdiff_t>(new_size);
+    for (u64 i = 0; shadow_begin + static_cast<std::ptrdiff_t>(i) != shadow_end; ++i)
+        clone->set_offset_initialized(i, (*(shadow_begin + static_cast<std::ptrdiff_t>(i))) != 0);
+    return clone;
 }
 
 SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
@@ -51,6 +75,7 @@ SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, 
     , m_path(std::move(path))
     , m_file_offset(file_offset)
     , m_bytes(size)
+    , m_initialized(size, 1)
 {
 }
 
@@ -59,6 +84,7 @@ SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, 
     , m_path(std::move(path))
     , m_file_offset(file_offset)
     , m_bytes(std::move(bytes))
+    , m_initialized(size, 1)
 {
     if (m_bytes.size() != size)
         throw EmulatorError("mmap region byte size mismatch");
@@ -69,16 +95,38 @@ u8 SoftMMU::MmapRegion::read_offset(u64 offset) const
     return m_bytes.at(static_cast<size_t>(offset));
 }
 
-void SoftMMU::MmapRegion::write_offset(u64 offset, u8 value)
+ValueWithShadow<u8> SoftMMU::MmapRegion::read_offset_with_shadow(u64 offset) const
+{
+    auto value = read_offset(offset);
+    return is_offset_initialized(offset) ? ValueWithShadow<u8>::initialized(value) : ValueWithShadow<u8>::uninitialized(value);
+}
+
+void SoftMMU::MmapRegion::write_offset(u64 offset, u8 value, bool initialized)
 {
     m_bytes.at(static_cast<size_t>(offset)) = value;
+    set_offset_initialized(offset, initialized);
+}
+
+bool SoftMMU::MmapRegion::is_offset_initialized(u64 offset) const
+{
+    return m_initialized.at(static_cast<size_t>(offset)) != 0;
+}
+
+void SoftMMU::MmapRegion::set_offset_initialized(u64 offset, bool initialized)
+{
+    m_initialized.at(static_cast<size_t>(offset)) = initialized ? 1 : 0;
 }
 
 std::unique_ptr<SoftMMU::Region> SoftMMU::MmapRegion::clone_slice(u64 new_base, u64 offset, u64 new_size) const
 {
     auto begin = m_bytes.begin() + static_cast<std::ptrdiff_t>(offset);
     auto end = begin + static_cast<std::ptrdiff_t>(new_size);
-    return std::make_unique<MmapRegion>(new_base, new_size, prot, name, m_path, m_file_offset + offset, std::vector<u8>(begin, end));
+    auto clone = std::make_unique<MmapRegion>(new_base, new_size, prot, name, m_path, m_file_offset + offset, std::vector<u8>(begin, end));
+    auto shadow_begin = m_initialized.begin() + static_cast<std::ptrdiff_t>(offset);
+    auto shadow_end = shadow_begin + static_cast<std::ptrdiff_t>(new_size);
+    for (u64 i = 0; shadow_begin + static_cast<std::ptrdiff_t>(i) != shadow_end; ++i)
+        clone->set_offset_initialized(i, (*(shadow_begin + static_cast<std::ptrdiff_t>(i))) != 0);
+    return clone;
 }
 
 void SoftMMU::sort_regions()
@@ -286,8 +334,18 @@ SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot)
 
 u8 SoftMMU::read8(u64 address) const
 {
+    auto value = read8_with_shadow(address);
+    if (value.is_uninitialized()) {
+        std::cerr << "uninitialized guest memory read at " << hex(address) << "\n";
+        throw EmulatorError("uninitialized guest memory read at " + hex(address));
+    }
+    return value.value();
+}
+
+ValueWithShadow<u8> SoftMMU::read8_with_shadow(u64 address) const
+{
     auto const& region = region_for(address, ProtRead);
-    return region.read_offset(address - region.base);
+    return region.read_offset_with_shadow(address - region.base);
 }
 
 u16 SoftMMU::read16(u64 address) const
@@ -316,8 +374,13 @@ u64 SoftMMU::read64(u64 address) const
 
 void SoftMMU::write8(u64 address, u8 value)
 {
+    write8_with_shadow(address, ValueWithShadow<u8>::initialized(value));
+}
+
+void SoftMMU::write8_with_shadow(u64 address, ValueWithShadow<u8> value)
+{
     auto& region = region_for(address, ProtWrite);
-    region.write_offset(address - region.base, value);
+    region.write_offset(address - region.base, value.value(), value.is_initialized());
 }
 
 void SoftMMU::write16(u64 address, u16 value)
@@ -336,6 +399,14 @@ void SoftMMU::write64(u64 address, u64 value)
 {
     for (size_t i = 0; i < sizeof(value); ++i)
         write8(address + i, static_cast<u8>(value >> (i * 8)));
+}
+
+void SoftMMU::mark_initialized(u64 address, size_t size, bool initialized)
+{
+    for (size_t i = 0; i < size; ++i) {
+        auto& region = region_for(address + i, ProtRead);
+        region.set_offset_initialized(address + i - region.base, initialized);
+    }
 }
 
 void SoftMMU::copy_from_guest(void* destination, u64 source, size_t size) const

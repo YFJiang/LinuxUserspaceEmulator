@@ -57,6 +57,10 @@
 #    endif
 #endif
 
+#ifndef MAP_UNINITIALIZED
+#    define MAP_UNINITIALIZED 0x4000000
+#endif
+
 namespace LUE {
 namespace {
 
@@ -856,6 +860,7 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         bool fixed_noreplace = false;
 #endif
         bool anonymous = arg4 & MAP_ANONYMOUS;
+        bool uninitialized = arg4 & MAP_UNINITIALIZED;
         u64 address = arg1;
         std::string mapping_name = "[mmap]";
         std::optional<std::string> mapped_path;
@@ -886,6 +891,8 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
             if (arg6 == 0 && mapped_path.has_value())
                 emulator.register_mapped_file(mapped_path.value(), address);
         }
+        if (uninitialized)
+            mmu.mark_initialized(address, static_cast<size_t>(size), false);
         mmu.protect(address, size, guest_prot);
         return address;
     }

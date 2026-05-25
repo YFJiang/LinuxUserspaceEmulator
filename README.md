@@ -20,13 +20,14 @@ Currently supported:
 - common file, time, polling, socket, and signal syscalls
 - basic guest signal handling and host signal forwarding
 - symbolic guest backtraces for loaded ELF images
+- basic byte-level shadow memory for initialized guest memory tracking
 
 Known limitations:
 
 - incomplete x86_64 instruction coverage
 - no thread or process model for `clone`, `fork`, or `execve`
 - no full POSIX signal semantics
-- no shadow memory, malloc tracing, or leak detection
+- no full CPU taint propagation, malloc tracing, or leak detection
 - no security isolation guarantee
 
 ## Build
