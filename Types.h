@@ -47,11 +47,13 @@ private:
 
 inline u64 page_align_down(u64 value)
 {
+    // Round down to the start of the containing page.
     return value & ~(page_size - 1);
 }
 
 inline u64 page_align_up(u64 value)
 {
+    // Round up to the next page boundary, leaving aligned values unchanged.
     return (value + page_size - 1) & ~(page_size - 1);
 }
 

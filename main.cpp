@@ -12,9 +12,11 @@ namespace {
 
 std::string find_executable(const std::string& command)
 {
+    // Commands containing a slash are already explicit paths.
     if (command.find('/') != std::string::npos)
         return command;
 
+    // Otherwise search PATH in the same left-to-right order as a shell.
     const char* path_env = std::getenv("PATH");
     if (!path_env)
         return {};
@@ -22,6 +24,7 @@ std::string find_executable(const std::string& command)
     std::stringstream paths(path_env);
     std::string directory;
     while (std::getline(paths, directory, ':')) {
+        // An empty PATH entry means the current directory.
         if (directory.empty())
             directory = ".";
         std::string candidate = directory + "/" + command;
