@@ -6,6 +6,12 @@
 
 namespace LUE {
 
+// Preferred base for ET_DYN main executables, matching the usual Linux PIE area.
+static constexpr u64 executable_dyn_base = 0x555555554000ULL;
+
+// Preferred base for the dynamic linker/interpreter, kept in a high shared-library area.
+static constexpr u64 interpreter_dyn_base = 0x7f0000000000ULL;
+
 struct LoadedProgram {
     u64 entry { 0 };
     u64 executable_entry { 0 };

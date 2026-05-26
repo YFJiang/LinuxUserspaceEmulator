@@ -36,6 +36,7 @@ LoadedObject load_object(SoftMMU& mmu, const std::string& path, u64 dyn_base)
     if (data.size() < sizeof(ELF::Elf64_Ehdr))
         throw EmulatorError(path + " is too small to be an ELF64 file");
 
+    // Validate the ELF header before using offsets and sizes from the file.
     auto ehdr = ELF::object_at<ELF::Elf64_Ehdr>(data, 0, "ELF object");
     if (ehdr.e_ident[0] != 0x7f || ehdr.e_ident[1] != 'E' || ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F')
         throw EmulatorError(path + " is not an ELF file");
@@ -54,6 +55,7 @@ LoadedObject load_object(SoftMMU& mmu, const std::string& path, u64 dyn_base)
     if (ehdr.e_phoff > data.size() || static_cast<u64>(ehdr.e_phnum) * ehdr.e_phentsize > data.size() - ehdr.e_phoff)
         throw EmulatorError(path + " has invalid program-header table");
 
+    // ET_DYN objects are position independent and get placed at dyn_base.
     u64 load_base = ehdr.e_type == ELF::ET_DYN ? dyn_base : 0;
     LoadedObject object;
     object.load_base = load_base;
@@ -61,6 +63,7 @@ LoadedObject load_object(SoftMMU& mmu, const std::string& path, u64 dyn_base)
     object.phent = ehdr.e_phentsize;
     object.phnum = ehdr.e_phnum;
 
+    // Program headers describe the interpreter, phdr location, and loadable segments.
     for (u16 i = 0; i < ehdr.e_phnum; ++i) {
         auto phdr = ELF::object_at<ELF::Elf64_Phdr>(data, ehdr.e_phoff + static_cast<u64>(i) * ehdr.e_phentsize, "ELF object");
         if (phdr.p_type == ELF::PT_INTERP) {
@@ -85,6 +88,7 @@ LoadedObject load_object(SoftMMU& mmu, const std::string& path, u64 dyn_base)
         if (phdr.p_offset > data.size() || phdr.p_filesz > data.size() - phdr.p_offset)
             throw EmulatorError(path + " has PT_LOAD outside file");
 
+        // Map the segment on page boundaries while preserving its in-page offset.
         u64 segment_start = load_base + phdr.p_vaddr;
         u64 map_start = page_align_down(segment_start);
         u64 map_offset = segment_start - map_start;
@@ -94,6 +98,7 @@ LoadedObject load_object(SoftMMU& mmu, const std::string& path, u64 dyn_base)
 
         object.brk_start = std::max(object.brk_start, page_align_up(segment_start + phdr.p_memsz));
 
+        // If PT_PHDR is absent, infer the phdr address from the segment containing it.
         if (!object.phdr && ehdr.e_phoff >= phdr.p_offset && ehdr.e_phoff < phdr.p_offset + phdr.p_filesz)
             object.phdr = segment_start + (ehdr.e_phoff - phdr.p_offset);
     }
@@ -109,7 +114,8 @@ LoadedObject load_object(SoftMMU& mmu, const std::string& path, u64 dyn_base)
 
 LoadedProgram ELFLoader::load(SoftMMU& mmu, const std::string& path)
 {
-    auto executable = load_object(mmu, path, 0x555555554000ULL);
+    // Load the main executable first; ET_DYN executables use this preferred base.
+    auto executable = load_object(mmu, path, executable_dyn_base);
 
     LoadedProgram program;
     program.entry = executable.entry;
@@ -123,7 +129,8 @@ LoadedProgram ELFLoader::load(SoftMMU& mmu, const std::string& path)
     program.interpreter_path = executable.interpreter;
 
     if (!executable.interpreter.empty()) {
-        auto interpreter = load_object(mmu, executable.interpreter, 0x7f0000000000ULL);
+        // Dynamic executables start in the interpreter, which later jumps to the program entry.
+        auto interpreter = load_object(mmu, executable.interpreter, interpreter_dyn_base);
         program.dynamic = true;
         program.entry = interpreter.entry;
         program.interpreter_base = interpreter.load_base;
