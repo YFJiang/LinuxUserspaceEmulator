@@ -7,6 +7,7 @@
 
 namespace LUE {
 
+// Record the address range, permissions, and display name shared by all regions.
 SoftMMU::Region::Region(u64 base, u64 size, int prot, std::string name)
     : base(base)
     , size(size)
@@ -15,6 +16,7 @@ SoftMMU::Region::Region(u64 base, u64 size, int prot, std::string name)
 {
 }
 
+// Create an anonymous in-memory region filled with zero bytes.
 SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string name)
     : Region(base, size, prot, std::move(name))
     , m_bytes(size)
@@ -22,6 +24,7 @@ SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string na
 {
 }
 
+// Create an anonymous in-memory region from an existing byte buffer.
 SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string name, std::vector<u8> bytes)
     : Region(base, size, prot, std::move(name))
     , m_bytes(std::move(bytes))
@@ -31,38 +34,46 @@ SoftMMU::SimpleRegion::SimpleRegion(u64 base, u64 size, int prot, std::string na
         throw EmulatorError("simple region byte size mismatch");
 }
 
+// Read one byte at a region-relative offset.
 u8 SoftMMU::SimpleRegion::read_offset(u64 offset) const
 {
     return m_bytes.at(static_cast<size_t>(offset));
 }
 
+// Read one byte and carry its initialization shadow state with it.
 ValueWithShadow<u8> SoftMMU::SimpleRegion::read_offset_with_shadow(u64 offset) const
 {
     auto value = read_offset(offset);
     return is_offset_initialized(offset) ? ValueWithShadow<u8>::initialized(value) : ValueWithShadow<u8>::uninitialized(value);
 }
 
+// Write one byte and update whether that byte is considered initialized.
 void SoftMMU::SimpleRegion::write_offset(u64 offset, u8 value, bool initialized)
 {
     m_bytes.at(static_cast<size_t>(offset)) = value;
     set_offset_initialized(offset, initialized);
 }
 
+// Report whether a region-relative byte has initialized data.
 bool SoftMMU::SimpleRegion::is_offset_initialized(u64 offset) const
 {
     return m_initialized.at(static_cast<size_t>(offset)) != 0;
 }
 
+// Set the initialization shadow state for one region-relative byte.
 void SoftMMU::SimpleRegion::set_offset_initialized(u64 offset, bool initialized)
 {
     m_initialized.at(static_cast<size_t>(offset)) = initialized ? 1 : 0;
 }
 
+// Clone a subrange into a standalone anonymous region.
 std::unique_ptr<SoftMMU::Region> SoftMMU::SimpleRegion::clone_slice(u64 new_base, u64 offset, u64 new_size) const
 {
+    // Copy the requested byte range into a new region at new_base.
     auto begin = m_bytes.begin() + static_cast<std::ptrdiff_t>(offset);
     auto end = begin + static_cast<std::ptrdiff_t>(new_size);
     auto clone = std::make_unique<SimpleRegion>(new_base, new_size, prot, name, std::vector<u8>(begin, end));
+    // Preserve the per-byte initialization shadow state for the slice.
     auto shadow_begin = m_initialized.begin() + static_cast<std::ptrdiff_t>(offset);
     auto shadow_end = shadow_begin + static_cast<std::ptrdiff_t>(new_size);
     for (u64 i = 0; shadow_begin + static_cast<std::ptrdiff_t>(i) != shadow_end; ++i)
@@ -70,6 +81,7 @@ std::unique_ptr<SoftMMU::Region> SoftMMU::SimpleRegion::clone_slice(u64 new_base
     return clone;
 }
 
+// Create a mmap-style region that remembers its source path and file offset.
 SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
     : Region(base, size, prot, std::move(name))
     , m_path(std::move(path))
@@ -79,6 +91,7 @@ SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, 
 {
 }
 
+// Create a mmap-style region from an existing byte buffer.
 SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset, std::vector<u8> bytes)
     : Region(base, size, prot, std::move(name))
     , m_path(std::move(path))
@@ -90,33 +103,39 @@ SoftMMU::MmapRegion::MmapRegion(u64 base, u64 size, int prot, std::string name, 
         throw EmulatorError("mmap region byte size mismatch");
 }
 
+// Read one byte at a mmap-region-relative offset.
 u8 SoftMMU::MmapRegion::read_offset(u64 offset) const
 {
     return m_bytes.at(static_cast<size_t>(offset));
 }
 
+// Read one mmap byte and carry its initialization shadow state with it.
 ValueWithShadow<u8> SoftMMU::MmapRegion::read_offset_with_shadow(u64 offset) const
 {
     auto value = read_offset(offset);
     return is_offset_initialized(offset) ? ValueWithShadow<u8>::initialized(value) : ValueWithShadow<u8>::uninitialized(value);
 }
 
+// Write one mmap byte and update whether that byte is considered initialized.
 void SoftMMU::MmapRegion::write_offset(u64 offset, u8 value, bool initialized)
 {
     m_bytes.at(static_cast<size_t>(offset)) = value;
     set_offset_initialized(offset, initialized);
 }
 
+// Report whether a mmap-region-relative byte has initialized data.
 bool SoftMMU::MmapRegion::is_offset_initialized(u64 offset) const
 {
     return m_initialized.at(static_cast<size_t>(offset)) != 0;
 }
 
+// Set the initialization shadow state for one mmap-region-relative byte.
 void SoftMMU::MmapRegion::set_offset_initialized(u64 offset, bool initialized)
 {
     m_initialized.at(static_cast<size_t>(offset)) = initialized ? 1 : 0;
 }
 
+// Clone a subrange into a standalone mmap-style region.
 std::unique_ptr<SoftMMU::Region> SoftMMU::MmapRegion::clone_slice(u64 new_base, u64 offset, u64 new_size) const
 {
     auto begin = m_bytes.begin() + static_cast<std::ptrdiff_t>(offset);
@@ -129,6 +148,7 @@ std::unique_ptr<SoftMMU::Region> SoftMMU::MmapRegion::clone_slice(u64 new_base, 
     return clone;
 }
 
+// Keep the region list ordered by guest base address.
 void SoftMMU::sort_regions()
 {
     std::sort(m_regions.begin(), m_regions.end(), [](const auto& a, const auto& b) {
@@ -136,6 +156,7 @@ void SoftMMU::sort_regions()
     });
 }
 
+// Validate that a new mapping is non-empty, non-wrapping, and non-overlapping.
 void SoftMMU::ensure_no_overlap(u64 base, u64 size) const
 {
     if (size == 0)
@@ -150,15 +171,20 @@ void SoftMMU::ensure_no_overlap(u64 base, u64 size) const
     }
 }
 
+// Map a page-aligned anonymous region initialized to zero bytes.
 void SoftMMU::map_zeroed(u64 base, u64 size, int prot, std::string name)
 {
+    // Guest mappings are always tracked at page granularity.
     base = page_align_down(base);
     size = page_align_up(size);
+    // Refuse overlapping mappings so each guest address has one owner.
     ensure_no_overlap(base, size);
+    // SimpleRegion default-initializes its bytes to zero.
     m_regions.push_back(std::make_unique<SimpleRegion>(base, size, prot, std::move(name)));
     sort_regions();
 }
 
+// Map a page-aligned anonymous region and copy source bytes into it.
 void SoftMMU::map_bytes(u64 base, u64 size, int prot, const u8* source, size_t source_size, size_t destination_offset, std::string name)
 {
     base = page_align_down(base);
@@ -174,6 +200,7 @@ void SoftMMU::map_bytes(u64 base, u64 size, int prot, const u8* source, size_t s
     sort_regions();
 }
 
+// Map a page-aligned mmap-style region with optional file identity metadata.
 void SoftMMU::map_mmap(u64 base, u64 size, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
 {
     base = page_align_down(base);
@@ -183,6 +210,7 @@ void SoftMMU::map_mmap(u64 base, u64 size, int prot, std::string name, std::opti
     sort_regions();
 }
 
+// Find free guest space and map a zero-filled anonymous allocation there.
 u64 SoftMMU::allocate(u64 size, u64 alignment, int prot, std::string name)
 {
     size = page_align_up(size);
@@ -206,6 +234,7 @@ u64 SoftMMU::allocate(u64 size, u64 alignment, int prot, std::string name)
     }
 }
 
+// Find free guest space and map a mmap-style allocation there.
 u64 SoftMMU::allocate_mmap(u64 size, u64 alignment, int prot, std::string name, std::optional<std::string> path, u64 file_offset)
 {
     size = page_align_up(size);
@@ -229,6 +258,7 @@ u64 SoftMMU::allocate_mmap(u64 size, u64 alignment, int prot, std::string name, 
     }
 }
 
+// Split overlapping regions so the target range can be independently modified.
 void SoftMMU::split_around(u64 base, u64 size)
 {
     u64 end = base + size;
@@ -236,19 +266,23 @@ void SoftMMU::split_around(u64 base, u64 size)
     rebuilt.reserve(m_regions.size() + 4);
 
     for (auto& region : m_regions) {
+        // Regions outside the target range can be kept as-is.
         if (end <= region->base || base >= region->end()) {
             rebuilt.push_back(std::move(region));
             continue;
         }
 
+        // Preserve any part before the target range as its own region.
         if (base > region->base) {
             rebuilt.push_back(region->clone_slice(region->base, 0, base - region->base));
         }
 
+        // Make the overlapping part a standalone region for unmap/protect.
         u64 overlap_start = std::max(base, region->base);
         u64 overlap_end = std::min(end, region->end());
         rebuilt.push_back(region->clone_slice(overlap_start, overlap_start - region->base, overlap_end - overlap_start));
 
+        // Preserve any part after the target range as its own region.
         if (end < region->end()) {
             rebuilt.push_back(region->clone_slice(end, end - region->base, region->end() - end));
         }
@@ -258,6 +292,7 @@ void SoftMMU::split_around(u64 base, u64 size)
     sort_regions();
 }
 
+// Remove any mappings covered by the requested page-aligned range.
 void SoftMMU::unmap(u64 base, u64 size)
 {
     if (size == 0)
@@ -271,6 +306,7 @@ void SoftMMU::unmap(u64 base, u64 size)
     }), m_regions.end());
 }
 
+// Change permissions on mappings covered by the requested page-aligned range.
 void SoftMMU::protect(u64 base, u64 size, int prot)
 {
     if (size == 0)
@@ -285,6 +321,7 @@ void SoftMMU::protect(u64 base, u64 size, int prot)
     }
 }
 
+// Check whether every byte in a guest range has a backing region.
 bool SoftMMU::is_mapped(u64 address, size_t size) const
 {
     for (size_t i = 0; i < size; ++i) {
@@ -294,6 +331,7 @@ bool SoftMMU::is_mapped(u64 address, size_t size) const
     return true;
 }
 
+// Find the immutable region containing a guest address, if any.
 const SoftMMU::Region* SoftMMU::find_region(u64 address) const
 {
     for (auto const& region : m_regions) {
@@ -303,6 +341,7 @@ const SoftMMU::Region* SoftMMU::find_region(u64 address) const
     return nullptr;
 }
 
+// Find the mutable region containing a guest address, if any.
 SoftMMU::Region* SoftMMU::find_region(u64 address)
 {
     for (auto& region : m_regions) {
@@ -312,6 +351,7 @@ SoftMMU::Region* SoftMMU::find_region(u64 address)
     return nullptr;
 }
 
+// Resolve a guest address to an immutable region and enforce permissions.
 const SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot) const
 {
     auto* region = find_region(address);
@@ -322,6 +362,7 @@ const SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot) const
     return *region;
 }
 
+// Resolve a guest address to a mutable region and enforce permissions.
 SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot)
 {
     auto* region = find_region(address);
@@ -332,6 +373,7 @@ SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot)
     return *region;
 }
 
+// Read an initialized byte from guest memory.
 u8 SoftMMU::read8(u64 address) const
 {
     auto value = read8_with_shadow(address);
@@ -342,12 +384,14 @@ u8 SoftMMU::read8(u64 address) const
     return value.value();
 }
 
+// Read a byte from guest memory while preserving shadow initialization state.
 ValueWithShadow<u8> SoftMMU::read8_with_shadow(u64 address) const
 {
     auto const& region = region_for(address, ProtRead);
     return region.read_offset_with_shadow(address - region.base);
 }
 
+// Read a little-endian 16-bit value from guest memory.
 u16 SoftMMU::read16(u64 address) const
 {
     u16 value = 0;
@@ -356,6 +400,7 @@ u16 SoftMMU::read16(u64 address) const
     return value;
 }
 
+// Read a little-endian 32-bit value from guest memory.
 u32 SoftMMU::read32(u64 address) const
 {
     u32 value = 0;
@@ -364,6 +409,7 @@ u32 SoftMMU::read32(u64 address) const
     return value;
 }
 
+// Read a little-endian 64-bit value from guest memory.
 u64 SoftMMU::read64(u64 address) const
 {
     u64 value = 0;
@@ -372,35 +418,41 @@ u64 SoftMMU::read64(u64 address) const
     return value;
 }
 
+// Write an initialized byte to guest memory.
 void SoftMMU::write8(u64 address, u8 value)
 {
     write8_with_shadow(address, ValueWithShadow<u8>::initialized(value));
 }
 
+// Write a byte to guest memory and preserve the supplied shadow state.
 void SoftMMU::write8_with_shadow(u64 address, ValueWithShadow<u8> value)
 {
     auto& region = region_for(address, ProtWrite);
     region.write_offset(address - region.base, value.value(), value.is_initialized());
 }
 
+// Write a little-endian 16-bit value to guest memory.
 void SoftMMU::write16(u64 address, u16 value)
 {
     for (size_t i = 0; i < sizeof(value); ++i)
         write8(address + i, static_cast<u8>(value >> (i * 8)));
 }
 
+// Write a little-endian 32-bit value to guest memory.
 void SoftMMU::write32(u64 address, u32 value)
 {
     for (size_t i = 0; i < sizeof(value); ++i)
         write8(address + i, static_cast<u8>(value >> (i * 8)));
 }
 
+// Write a little-endian 64-bit value to guest memory.
 void SoftMMU::write64(u64 address, u64 value)
 {
     for (size_t i = 0; i < sizeof(value); ++i)
         write8(address + i, static_cast<u8>(value >> (i * 8)));
 }
 
+// Mark a guest byte range as initialized or uninitialized.
 void SoftMMU::mark_initialized(u64 address, size_t size, bool initialized)
 {
     for (size_t i = 0; i < size; ++i) {
@@ -409,6 +461,7 @@ void SoftMMU::mark_initialized(u64 address, size_t size, bool initialized)
     }
 }
 
+// Copy initialized bytes from guest memory into a host buffer.
 void SoftMMU::copy_from_guest(void* destination, u64 source, size_t size) const
 {
     auto* out = static_cast<u8*>(destination);
@@ -416,6 +469,7 @@ void SoftMMU::copy_from_guest(void* destination, u64 source, size_t size) const
         out[i] = read8(source + i);
 }
 
+// Copy bytes from a host buffer into guest memory.
 void SoftMMU::copy_to_guest(u64 destination, const void* source, size_t size)
 {
     auto const* in = static_cast<const u8*>(source);
@@ -423,6 +477,7 @@ void SoftMMU::copy_to_guest(u64 destination, const void* source, size_t size)
         write8(destination + i, in[i]);
 }
 
+// Return a host vector containing initialized bytes copied from guest memory.
 std::vector<u8> SoftMMU::copy_buffer_from_guest(u64 source, size_t size) const
 {
     std::vector<u8> buffer(size);
@@ -430,6 +485,7 @@ std::vector<u8> SoftMMU::copy_buffer_from_guest(u64 source, size_t size) const
     return buffer;
 }
 
+// Read a NUL-terminated string from guest memory with a maximum length guard.
 std::string SoftMMU::read_c_string(u64 address, size_t limit) const
 {
     std::string value;
@@ -443,6 +499,7 @@ std::string SoftMMU::read_c_string(u64 address, size_t limit) const
     throw EmulatorError("unterminated guest string at " + hex(address));
 }
 
+// Print the current guest memory map for diagnostics.
 void SoftMMU::dump_regions(std::ostream& stream) const
 {
     for (auto const& region : m_regions) {
