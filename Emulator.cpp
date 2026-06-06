@@ -56,6 +56,7 @@ enum SignalFrameOffset : u64 {
 
 std::string basename(const std::string& path)
 {
+    // Return the final path component after the last '/'.
     auto slash = path.find_last_of('/');
     if (slash == std::string::npos)
         return path;
@@ -76,6 +77,7 @@ std::string image_kind_for_path(const std::string& path)
 
 std::optional<std::string> path_from_host_fd(int fd)
 {
+    // Resolve the host file descriptor to its path via /proc/self/fd.
     char proc_path[64];
     std::snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
     std::array<char, 4096> path {};
@@ -144,6 +146,7 @@ int Emulator::exec()
             collect_host_signals();
             dispatch_pending_signal();
         }
+    // The guest program exited normally; return its exit status.
     } catch (const GuestExit& exit) {
         if (m_options.backtrace_on_exit) {
             if (!m_last_non_exit_syscall_backtrace.empty()) {
@@ -155,6 +158,7 @@ int Emulator::exec()
             }
         }
         return exit.status();
+    // The emulator failed while loading or executing the guest.
     } catch (const EmulatorError& error) {
         std::cerr << "\nLinuxUserspaceEmulator: " << error.what() << "\n";
         dump_state();
@@ -164,24 +168,24 @@ int Emulator::exec()
 
 void Emulator::load()
 {
-    m_program = ELFLoader::load(m_mmu, m_executable_path);
-    register_loaded_image(m_program.executable_path, m_program.executable_base, "executable");
+    m_program = ELFLoader::load(m_mmu, m_executable_path); // Load the guest ELF into the emulated address space.
+    register_loaded_image(m_program.executable_path, m_program.executable_base, "executable"); // Track the main executable image.
     if (m_program.dynamic && !m_program.interpreter_path.empty())
-        register_loaded_image(m_program.interpreter_path, m_program.interpreter_base, "loader");
-    setup_signal_trampoline();
-    register_host_signal_handlers();
+        register_loaded_image(m_program.interpreter_path, m_program.interpreter_base, "loader"); // Track the dynamic loader image.
+    setup_signal_trampoline(); // Install the guest-side signal return trampoline.
+    register_host_signal_handlers(); // Register host signal handlers used by the emulator.
 
-    m_brk_start = page_align_up(m_program.brk_start);
-    m_brk = m_brk_start;
-    m_brk_region_end = m_brk_start;
+    m_brk_start = page_align_up(m_program.brk_start); // Align the initial program break to a page boundary.
+    m_brk = m_brk_start; // Initialize the current program break.
+    m_brk_region_end = m_brk_start; // Initialize the mapped brk region end.
 
-    u64 stack_low = m_stack_base - m_stack_size;
-    m_mmu.map_zeroed(stack_low, m_stack_size, ProtRead | ProtWrite, "[stack]");
-    m_stack_top = m_stack_base;
-    setup_stack();
+    u64 stack_low = m_stack_base - m_stack_size; // Compute the lowest address of the guest stack.
+    m_mmu.map_zeroed(stack_low, m_stack_size, ProtRead | ProtWrite, "[stack]"); // Map a zero-filled read/write stack.
+    m_stack_top = m_stack_base; // Start stack construction at the top of the stack region.
+    setup_stack(); // Populate the initial guest stack contents.
 
-    m_cpu.set_rip(m_program.entry);
-    m_cpu.set_reg(SoftCPU64::RSP, m_stack_top);
+    m_cpu.set_rip(m_program.entry); // Set the guest instruction pointer to the ELF entry point.
+    m_cpu.set_reg(SoftCPU64::RSP, m_stack_top); // Set the guest stack pointer to the prepared stack.
 }
 
 void Emulator::push64(u64 value)
@@ -207,14 +211,17 @@ void Emulator::setup_stack()
     std::vector<u64> argv;
     std::vector<u64> envp;
 
+    // Copy argument strings onto the guest stack and remember their addresses.
     for (auto it = m_arguments.rbegin(); it != m_arguments.rend(); ++it)
         argv.push_back(push_string(*it));
     std::reverse(argv.begin(), argv.end());
 
+    // Copy environment strings onto the guest stack and remember their addresses.
     for (auto it = m_environment.rbegin(); it != m_environment.rend(); ++it)
         envp.push_back(push_string(*it));
     std::reverse(envp.begin(), envp.end());
 
+    // Store strings and random bytes referenced by the auxiliary vector.
     u64 execfn = push_string(m_executable_path);
     u64 platform = push_string("x86_64");
 
@@ -225,6 +232,7 @@ void Emulator::setup_stack()
 
     m_stack_top &= ~0xfULL;
 
+    // Build the Linux auxiliary vector expected by the loader and libc.
     std::vector<std::pair<u64, u64>> auxv;
     auxv.push_back({ AT_PHDR, m_program.phdr });
     auxv.push_back({ AT_PHENT, m_program.phent });
@@ -246,6 +254,7 @@ void Emulator::setup_stack()
     auxv.push_back({ AT_EXECFN, execfn });
     auxv.push_back({ AT_NULL, 0 });
 
+    // Push auxv, envp, argv, and argc in the initial Linux process stack layout.
     for (auto it = auxv.rbegin(); it != auxv.rend(); ++it) {
         push64(it->second);
         push64(it->first);
@@ -264,10 +273,13 @@ void Emulator::setup_stack()
 
 u64 Emulator::set_brk(u64 requested)
 {
+    // A zero request queries the current program break.
     if (requested == 0)
         return m_brk;
+    // Do not allow the heap to move before its initial start address.
     if (requested < m_brk_start)
         return m_brk;
+    // Map more zeroed heap pages if the requested break extends past the mapped region.
     if (requested > m_brk_region_end) {
         u64 new_end = page_align_up(requested);
         if (new_end > m_brk_region_end) {
@@ -275,6 +287,7 @@ u64 Emulator::set_brk(u64 requested)
             m_brk_region_end = new_end;
         }
     }
+    // Record the new program break and return it to the guest.
     m_brk = requested;
     return m_brk;
 }
@@ -300,6 +313,7 @@ void Emulator::setup_signal_trampoline()
 
 void Emulator::register_host_signal_handlers()
 {
+    // Install the shared host signal handler for one signal number.
     auto register_one = [](int signum) {
         struct sigaction action {};
         action.sa_handler = host_signal_handler;
@@ -308,6 +322,7 @@ void Emulator::register_host_signal_handlers()
         sigaction(signum, &action, nullptr);
     };
 
+    // Forward selected host signals into the emulated guest signal path.
     register_one(SIGHUP);
     register_one(SIGINT);
     register_one(SIGQUIT);
@@ -319,10 +334,14 @@ void Emulator::register_host_signal_handlers()
 
 void Emulator::collect_host_signals()
 {
+    // Check the host signal flags that were set by the async signal handler.
     for (int signum = 1; signum < NSIG && signum < 64; ++signum) {
+        // Skip signals that have not been received by the host process.
         if (!s_host_signal_pending[signum])
             continue;
+        // Clear the pending flag before delivering the signal to the guest.
         s_host_signal_pending[signum] = 0;
+        // Queue the signal for the emulated guest process.
         deliver_signal(signum);
     }
 }
@@ -334,27 +353,33 @@ bool Emulator::is_signal_blocked(int signum) const
 
 void Emulator::dispatch_pending_signal()
 {
+    // Find the first pending guest signal that is not currently blocked.
     for (int signum = 1; signum < NSIG && signum < 64; ++signum) {
         auto bit = signal_bit(signum);
         if (!(m_pending_signals & bit) || is_signal_blocked(signum))
             continue;
 
+        // Consume the pending signal before applying its disposition.
         m_pending_signals &= ~bit;
         auto const& action = m_signal_actions[static_cast<size_t>(signum)];
 
+        // SIG_IGN ignores the signal.
         if (action.handler == 1)
             return;
+        // SIG_DFL either ignores the signal or terminates the guest.
         if (action.handler == 0) {
             if (default_signal_is_ignored(signum))
                 return;
             throw GuestExit(128 + signum);
         }
 
+        // Build a guest signal frame below the current stack pointer.
         u64 old_rsp = m_cpu.reg(SoftCPU64::RSP);
         u64 frame = (old_rsp - signal_frame_size - 128) & ~0xfULL;
         u64 handler_rsp = frame - 8;
         u64 restorer = action.restorer ? action.restorer : m_signal_trampoline;
 
+        // Save the interrupted guest CPU state for sigreturn.
         m_mmu.write64(handler_rsp, restorer);
         m_mmu.write64(frame + SignalFrameMagic, signal_frame_magic);
         m_mmu.write64(frame + SignalFrameMask, m_signal_mask);
@@ -365,9 +390,11 @@ void Emulator::dispatch_pending_signal()
         m_mmu.write64(frame + SignalFrameFsBase, m_cpu.fs_base());
         m_mmu.write64(frame + SignalFrameGsBase, m_cpu.gs_base());
 
+        // Apply the signal mask while the handler is running.
         m_signal_mask |= action.mask;
         m_signal_mask |= bit;
 
+        // Enter the guest signal handler with Linux-style argument registers.
         m_cpu.set_reg(SoftCPU64::RDI, static_cast<u64>(signum));
         m_cpu.set_reg(SoftCPU64::RSI, 0);
         m_cpu.set_reg(SoftCPU64::RDX, 0);
@@ -380,11 +407,14 @@ void Emulator::dispatch_pending_signal()
 
 int Emulator::set_signal_action(int signum, bool update_action, u64 handler, u64 flags, u64 restorer, u64 mask, u64 old_action_address)
 {
+    // Reject invalid signal numbers.
     if (signum <= 0 || signum >= NSIG || signum >= 64)
         return -EINVAL;
+    // SIGKILL and SIGSTOP cannot have custom dispositions.
     if (signum == SIGKILL || signum == SIGSTOP)
         return -EINVAL;
 
+    // Return the previous guest signal action if the caller requested it.
     if (old_action_address) {
         auto const& old_action = m_signal_actions[static_cast<size_t>(signum)];
         m_mmu.write64(old_action_address + 0, old_action.handler);
@@ -393,6 +423,7 @@ int Emulator::set_signal_action(int signum, bool update_action, u64 handler, u64
         m_mmu.write64(old_action_address + 24, old_action.mask);
     }
 
+    // Store the new guest signal action when this call updates the disposition.
     if (update_action)
         m_signal_actions[static_cast<size_t>(signum)] = { handler, flags, restorer, mask };
     return 0;
@@ -434,10 +465,13 @@ int Emulator::deliver_signal(int signum)
 
 u64 Emulator::handle_sigreturn()
 {
+    // The guest stack pointer points at the signal frame built before handler entry.
     u64 frame = m_cpu.reg(SoftCPU64::RSP);
+    // Verify that the guest is returning from a frame created by this emulator.
     if (m_mmu.read64(frame + SignalFrameMagic) != signal_frame_magic)
         throw EmulatorError("invalid guest signal frame at " + hex(frame));
 
+    // Read the saved signal mask and CPU state from the guest signal frame.
     m_signal_mask = m_mmu.read64(frame + SignalFrameMask);
     u64 restored_rip = m_mmu.read64(frame + SignalFrameRip);
     u64 restored_rflags = m_mmu.read64(frame + SignalFrameRflags);
@@ -447,6 +481,7 @@ u64 Emulator::handle_sigreturn()
     u64 restored_fs = m_mmu.read64(frame + SignalFrameFsBase);
     u64 restored_gs = m_mmu.read64(frame + SignalFrameGsBase);
 
+    // Restore the interrupted guest CPU context.
     for (int i = 0; i < 16; ++i)
         m_cpu.set_reg(i, restored_regs[static_cast<size_t>(i)]);
     m_cpu.set_fs_base(restored_fs);
@@ -454,6 +489,7 @@ u64 Emulator::handle_sigreturn()
     m_cpu.set_rflags(restored_rflags);
     m_cpu.set_rip(restored_rip);
     m_restored_context_from_sigreturn = true;
+    // sigreturn resumes with the original RAX value, not a new syscall result.
     return restored_regs[SoftCPU64::RAX];
 }
 
@@ -501,13 +537,16 @@ void Emulator::register_mapped_file(const std::string& path, u64 mapped_address)
 
 void Emulator::register_loaded_image(const std::string& path, u64 load_base, std::string kind)
 {
+    // Ignore mappings that do not have a backing file path.
     if (path.empty())
         return;
+    // Avoid registering the same image at the same base more than once.
     for (auto const& image : m_loaded_images) {
         if (image.path == path && image.base == load_base)
             return;
     }
 
+    // Read ELF ranges and symbols so runtime addresses can be described later.
     ELFImageInfo info;
     try {
         info = read_elf_image_info(path);
@@ -515,6 +554,7 @@ void Emulator::register_loaded_image(const std::string& path, u64 load_base, std
         return;
     }
 
+    // Convert ELF-relative ranges and symbols into guest runtime addresses.
     LoadedImage image;
     image.path = path;
     image.name = basename(path);
@@ -529,6 +569,7 @@ void Emulator::register_loaded_image(const std::string& path, u64 load_base, std
         image.symbols.push_back({ start, start + size, symbol.name });
     }
 
+    // Remember selected libc allocation symbols for allocation-aware diagnostics.
     auto remember_malloc_symbol = [&](const std::string& name, SymbolRange& target) {
         auto it = std::find_if(image.symbols.begin(), image.symbols.end(), [&](auto const& symbol) {
             return symbol.name == name;
@@ -545,6 +586,7 @@ void Emulator::register_loaded_image(const std::string& path, u64 load_base, std
         remember_malloc_symbol("malloc_usable_size", m_malloc_usable_size_symbol);
     }
 
+    // Keep the image available for address lookup and backtraces.
     m_loaded_images.push_back(std::move(image));
 }
 
@@ -597,26 +639,33 @@ std::string Emulator::symbolize(u64 address) const
 std::vector<u64> Emulator::raw_backtrace() const
 {
     std::vector<u64> backtrace;
+    // Start with the instruction currently being executed.
     backtrace.push_back(m_cpu.rip());
 
+    // Append non-zero addresses once to avoid duplicate backtrace entries.
     auto append_address = [&](u64 address) {
         if (address && std::find(backtrace.begin(), backtrace.end(), address) == backtrace.end())
             backtrace.push_back(address);
     };
 
+    // Prefer the synthetic call stack maintained by the emulated CPU.
     auto const& call_stack = m_cpu.call_stack();
     for (auto it = call_stack.rbegin(); it != call_stack.rend() && backtrace.size() < 128; ++it)
         append_address(*it);
 
+    // Fall back to walking the guest RBP frame chain.
     u64 frame = m_cpu.reg(SoftCPU64::RBP);
     for (size_t depth = 0; depth < 127 && frame; ++depth) {
+        // Stop if the frame pointer does not reference a readable frame.
         if (!m_mmu.is_mapped(frame, 16))
             break;
         u64 next_frame = m_mmu.read64(frame);
         u64 return_address = m_mmu.read64(frame + 8);
+        // A zero return address marks the end of a usable frame chain.
         if (!return_address)
             break;
         append_address(return_address);
+        // Require the frame chain to move forward to avoid loops.
         if (next_frame <= frame)
             break;
         frame = next_frame;

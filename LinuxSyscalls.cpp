@@ -64,6 +64,7 @@
 namespace LUE {
 namespace {
 
+// Converts a positive error code to a negative error return value used by Linux syscalls.
 u64 syscall_error(int err)
 {
     return static_cast<u64>(-static_cast<i64>(err));
@@ -576,6 +577,7 @@ void copy_sockaddr_to_guest(SoftMMU& mmu, u64 address, u64 length_address, const
         mmu.write32(length_address, length);
 }
 
+// Writes file descriptors to the guest's memory and registers them with the emulator.
 void write_guest_fds(Emulator& emulator, u64 address, const int* fds, size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
