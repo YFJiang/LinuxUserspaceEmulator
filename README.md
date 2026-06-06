@@ -21,13 +21,14 @@ Currently supported:
 - basic guest signal handling and host signal forwarding
 - symbolic guest backtraces for loaded ELF images
 - basic byte-level shadow memory for initialized guest memory tracking
+- basic malloc tracing for leaks, heap overflow writes, and use-after-free writes
 
 Known limitations:
 
 - incomplete x86_64 instruction coverage
 - no thread or process model for `clone`, `fork`, or `execve`
 - no full POSIX signal semantics
-- no full CPU taint propagation, malloc tracing, or leak detection
+- no full CPU taint propagation or production-grade heap sanitizer
 - no security isolation guarantee
 
 ## Build
@@ -51,6 +52,7 @@ Useful options:
 ./build/LinuxUserspaceEmulator --help
 ./build/LinuxUserspaceEmulator --trace-syscalls ./guest-program
 ./build/LinuxUserspaceEmulator --backtrace-on-exit ./guest-program
+./build/LinuxUserspaceEmulator --malloc-trace ./guest-program
 ```
 
 Example:

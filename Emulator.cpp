@@ -127,7 +127,14 @@ Emulator::Emulator(std::string executable_path, std::vector<std::string> argumen
     , m_environment(std::move(environment))
     , m_options(options)
     , m_cpu(*this)
+    , m_malloc_tracer(*this)
 {
+    m_malloc_tracer.set_enabled(options.malloc_trace);
+    if (options.malloc_trace) {
+        m_mmu.set_write_observer([this](u64 address) {
+            m_malloc_tracer.on_memory_write(address);
+        });
+    }
 }
 
 int Emulator::exec()
@@ -143,11 +150,15 @@ int Emulator::exec()
             } else {
                 m_cpu.step();
             }
+            if (m_options.malloc_trace)
+                m_malloc_tracer.step();
             collect_host_signals();
             dispatch_pending_signal();
         }
     // The guest program exited normally; return its exit status.
     } catch (const GuestExit& exit) {
+        if (m_options.malloc_trace)
+            m_malloc_tracer.dump_leak_report(std::cerr);
         if (m_options.backtrace_on_exit) {
             if (!m_last_non_exit_syscall_backtrace.empty()) {
                 std::cerr << "guest exit backtrace (last non-exit syscall):\n";
@@ -160,6 +171,8 @@ int Emulator::exec()
         return exit.status();
     // The emulator failed while loading or executing the guest.
     } catch (const EmulatorError& error) {
+        if (m_options.malloc_trace)
+            m_malloc_tracer.dump_leak_report(std::cerr);
         std::cerr << "\nLinuxUserspaceEmulator: " << error.what() << "\n";
         dump_state();
         return 127;
@@ -699,6 +712,12 @@ bool Emulator::is_in_loader_code() const
 bool Emulator::is_in_libc() const
 {
     auto* image = image_containing(m_cpu.rip());
+    return image && image->kind == "libc";
+}
+
+bool Emulator::is_in_libc(u64 address) const
+{
+    auto* image = image_containing(address);
     return image && image->kind == "libc";
 }
 

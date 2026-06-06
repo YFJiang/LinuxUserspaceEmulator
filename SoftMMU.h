@@ -3,6 +3,7 @@
 #include "Types.h"
 #include "ValueWithShadow.h"
 
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <optional>
@@ -107,6 +108,7 @@ public:
     void write32(u64 address, u32 value);
     void write64(u64 address, u64 value);
     void mark_initialized(u64 address, size_t size, bool initialized);
+    void set_write_observer(std::function<void(u64)> observer);
 
     void copy_from_guest(void* destination, u64 source, size_t size) const;
     void copy_to_guest(u64 destination, const void* source, size_t size);
@@ -123,6 +125,7 @@ private:
     void sort_regions();
 
     std::vector<std::unique_ptr<Region>> m_regions;
+    std::function<void(u64)> m_write_observer;
     u64 m_next_allocation { 0x700000000000ULL };
 };
 

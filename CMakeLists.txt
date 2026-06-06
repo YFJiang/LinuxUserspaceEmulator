@@ -14,6 +14,7 @@ add_executable(LinuxUserspaceEmulator
     Emulator.cpp
     ELFSymbols.cpp
     LinuxSyscalls.cpp
+    MallocTracer.cpp
     SoftCPU64.cpp
     SoftMMU.cpp
     main.cpp

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ELFLoader.h"
+#include "MallocTracer.h"
 #include "SoftCPU64.h"
 
 #include <array>
@@ -16,9 +17,12 @@ struct EmulatorOptions {
     bool trace { false };
     bool trace_syscalls { false };
     bool backtrace_on_exit { false };
+    bool malloc_trace { false };
 };
 
 class Emulator {
+    friend class MallocTracer;
+
 public:
     Emulator(std::string executable_path, std::vector<std::string> arguments, std::vector<std::string> environment, EmulatorOptions);
 
@@ -49,6 +53,7 @@ public:
 
     bool is_in_loader_code() const;
     bool is_in_libc() const;
+    bool is_in_libc(u64 address) const;
     bool is_in_libsystem() const;
     bool is_in_malloc_or_free() const;
 
@@ -57,6 +62,8 @@ public:
     int deliver_signal(int signum);
 
     void dump_state() const;
+    MallocTracer& malloc_tracer() { return m_malloc_tracer; }
+    const MallocTracer& malloc_tracer() const { return m_malloc_tracer; }
 
 private:
     struct SymbolRange {
@@ -132,6 +139,8 @@ private:
     SymbolRange m_calloc_symbol;
     SymbolRange m_free_symbol;
     SymbolRange m_malloc_usable_size_symbol;
+
+    MallocTracer m_malloc_tracer;
 };
 
 }

@@ -42,6 +42,7 @@ void print_usage(const char* argv0)
               << "  -h, --help             Show this help text and exit\n"
               << "      --trace            Print every guest instruction and registers\n"
               << "      --trace-syscalls   Print guest Linux syscalls\n"
+              << "      --malloc-trace     Track guest malloc/free/realloc/calloc diagnostics\n"
               << "      --backtrace-on-exit\n"
               << "                         Print a symbolic guest backtrace on normal exit\n";
 }
@@ -68,6 +69,10 @@ int main(int argc, char** argv, char** envp)
         }
         if (std::strcmp(argv[i], "--backtrace-on-exit") == 0) {
             options.backtrace_on_exit = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--malloc-trace") == 0) {
+            options.malloc_trace = true;
             continue;
         }
         guest_arguments.emplace_back(argv[i]);

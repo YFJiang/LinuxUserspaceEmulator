@@ -428,6 +428,8 @@ void SoftMMU::write8(u64 address, u8 value)
 void SoftMMU::write8_with_shadow(u64 address, ValueWithShadow<u8> value)
 {
     auto& region = region_for(address, ProtWrite);
+    if (m_write_observer)
+        m_write_observer(address);
     region.write_offset(address - region.base, value.value(), value.is_initialized());
 }
 
@@ -459,6 +461,11 @@ void SoftMMU::mark_initialized(u64 address, size_t size, bool initialized)
         auto& region = region_for(address + i, ProtRead);
         region.set_offset_initialized(address + i - region.base, initialized);
     }
+}
+
+void SoftMMU::set_write_observer(std::function<void(u64)> observer)
+{
+    m_write_observer = std::move(observer);
 }
 
 // Copy initialized bytes from guest memory into a host buffer.
