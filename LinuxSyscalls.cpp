@@ -23,7 +23,9 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/uio.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -159,6 +161,30 @@ const char* syscall_name(u64 number)
 #ifdef SYS_newfstatat
     case SYS_newfstatat:
         return "newfstatat";
+#endif
+#ifdef SYS_statfs
+    case SYS_statfs:
+        return "statfs";
+#endif
+#ifdef SYS_fstatfs
+    case SYS_fstatfs:
+        return "fstatfs";
+#endif
+#ifdef SYS_statx
+    case SYS_statx:
+        return "statx";
+#endif
+#ifdef SYS_getxattr
+    case SYS_getxattr:
+        return "getxattr";
+#endif
+#ifdef SYS_lgetxattr
+    case SYS_lgetxattr:
+        return "lgetxattr";
+#endif
+#ifdef SYS_fgetxattr
+    case SYS_fgetxattr:
+        return "fgetxattr";
 #endif
 #ifdef SYS_mmap
     case SYS_mmap:
@@ -532,6 +558,42 @@ GuestStat convert_stat(const struct stat& st)
     return out;
 }
 
+// Matches the x86-64 Linux `struct statfs` the kernel returns for statfs/fstatfs.
+struct GuestStatfs {
+    i64 f_type;
+    i64 f_bsize;
+    u64 f_blocks;
+    u64 f_bfree;
+    u64 f_bavail;
+    u64 f_files;
+    u64 f_ffree;
+    u32 f_fsid[2];
+    i64 f_namelen;
+    i64 f_frsize;
+    i64 f_flags;
+    i64 f_spare[4];
+};
+
+static_assert(sizeof(GuestStatfs) == 120);
+
+GuestStatfs convert_statfs(const struct statfs& sf)
+{
+    GuestStatfs out {};
+    out.f_type = static_cast<i64>(sf.f_type);
+    out.f_bsize = static_cast<i64>(sf.f_bsize);
+    out.f_blocks = static_cast<u64>(sf.f_blocks);
+    out.f_bfree = static_cast<u64>(sf.f_bfree);
+    out.f_bavail = static_cast<u64>(sf.f_bavail);
+    out.f_files = static_cast<u64>(sf.f_files);
+    out.f_ffree = static_cast<u64>(sf.f_ffree);
+    // f_fsid is an opaque pair of ints; copy its bytes without depending on member names.
+    std::memcpy(out.f_fsid, &sf.f_fsid, sizeof(out.f_fsid));
+    out.f_namelen = static_cast<i64>(sf.f_namelen);
+    out.f_frsize = static_cast<i64>(sf.f_frsize);
+    out.f_flags = static_cast<i64>(sf.f_flags);
+    return out;
+}
+
 int prot_from_linux(u64 prot)
 {
     int result = 0;
@@ -846,6 +908,90 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         auto guest = convert_stat(st);
         mmu.copy_to_guest(arg3, &guest, sizeof(guest));
         return 0;
+    }
+#endif
+
+#ifdef SYS_statfs
+    case SYS_statfs: {
+        auto path = mmu.read_c_string(arg1);
+        struct statfs sf {};
+        if (::statfs(path.c_str(), &sf) < 0)
+            return syscall_error(errno);
+        auto guest = convert_statfs(sf);
+        mmu.copy_to_guest(arg2, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_fstatfs
+    case SYS_fstatfs: {
+        struct statfs sf {};
+        if (::fstatfs(static_cast<int>(arg1), &sf) < 0)
+            return syscall_error(errno);
+        auto guest = convert_statfs(sf);
+        mmu.copy_to_guest(arg2, &guest, sizeof(guest));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_statx
+    case SYS_statx: {
+        std::string path;
+        const char* path_ptr = nullptr;
+        if (arg2) {
+            path = mmu.read_c_string(arg2);
+            path_ptr = path.c_str();
+        }
+        // statx fills a fixed kernel-ABI struct that is identical on the x86-64
+        // host and guest, so the result can be forwarded verbatim.
+        struct statx stx {};
+        long rc = ::syscall(SYS_statx, static_cast<int>(arg1), path_ptr,
+            static_cast<int>(arg3), static_cast<unsigned>(arg4), &stx);
+        if (rc < 0)
+            return syscall_error(errno);
+        mmu.copy_to_guest(arg5, &stx, sizeof(stx));
+        return 0;
+    }
+#endif
+
+#ifdef SYS_getxattr
+    case SYS_getxattr:
+#endif
+#ifdef SYS_lgetxattr
+    case SYS_lgetxattr:
+#endif
+#ifdef SYS_fgetxattr
+    case SYS_fgetxattr:
+#endif
+#if defined(SYS_getxattr) || defined(SYS_lgetxattr) || defined(SYS_fgetxattr)
+    {
+        // getxattr/lgetxattr take (path, name, value, size); fgetxattr takes
+        // (fd, name, value, size). The value buffer is optional (size 0 just
+        // queries the length), so only copy back what the host actually wrote.
+        auto name = mmu.read_c_string(arg2);
+        size_t size = static_cast<size_t>(arg4);
+        std::vector<u8> buffer(size);
+        void* value = size ? buffer.data() : nullptr;
+        ssize_t rc = -1;
+#ifdef SYS_fgetxattr
+        if (number == SYS_fgetxattr) {
+            rc = ::fgetxattr(static_cast<int>(arg1), name.c_str(), value, size);
+        } else
+#endif
+        {
+            auto path = mmu.read_c_string(arg1);
+#ifdef SYS_lgetxattr
+            if (number == SYS_lgetxattr)
+                rc = ::lgetxattr(path.c_str(), name.c_str(), value, size);
+            else
+#endif
+                rc = ::getxattr(path.c_str(), name.c_str(), value, size);
+        }
+        if (rc < 0)
+            return syscall_error(errno);
+        if (size && rc > 0)
+            mmu.copy_to_guest(arg3, buffer.data(), static_cast<size_t>(rc));
+        return static_cast<u64>(rc);
     }
 #endif
 

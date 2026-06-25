@@ -30,6 +30,9 @@ Known limitations:
 - incomplete x86_64 instruction coverage
 - no thread or process model for `clone`, `fork`, or `execve`
 - no full POSIX signal semantics
+- no `mremap` (syscall 25), so guests that grow a mapping in place are
+  unsupported; e.g. `ls` on a very large directory fails because glibc uses
+  `mremap` to grow its `getdents` buffer
 - taint propagation is whole-result (not bit-precise) and does not cover the
   x87/SSE register file; no production-grade heap sanitizer
 - no security isolation guarantee

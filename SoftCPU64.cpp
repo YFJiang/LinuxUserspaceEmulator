@@ -931,6 +931,19 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         return;
     }
 
+    if (opcode >= 0xc8 && opcode <= 0xcf) {
+        // BSWAP: reverse the byte order of a 32- or 64-bit register.
+        int reg = (opcode - 0xc8) + prefixes.rex_b();
+        int width = prefixes.rex_w() ? 64 : 32;
+        u64 value = read_gpr(reg, width, prefixes);
+        int bytes = width / 8;
+        u64 swapped = 0;
+        for (int i = 0; i < bytes; ++i)
+            swapped |= ((value >> (i * 8)) & 0xff) << ((bytes - 1 - i) * 8);
+        write_gpr(reg, width, swapped, prefixes);
+        return;
+    }
+
     switch (opcode) {
     case 0x05: {
         u64 next_rip = m_decode_pc;
@@ -948,7 +961,15 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         m_decode_pc = next_rip;
         break;
     }
+    case 0x18: // PREFETCHNTA/T0/T1/T2 and reserved hint-NOPs
+    case 0x19:
+    case 0x1a:
+    case 0x1b:
+    case 0x1c:
+    case 0x1d:
     case 0x1f: {
+        // Multi-byte NOP / prefetch hints: no architectural effect, but the
+        // ModRM (and any memory operand bytes) must still be consumed.
         auto modrm = fetch_modrm(prefixes);
         if (!modrm.is_register())
             (void)decode_memory_address(prefixes, modrm);
@@ -968,12 +989,16 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
     }
     case 0xae: {
         auto modrm = fetch_modrm(prefixes);
-        auto operand = decode_rm_operand(prefixes, modrm);
-        if (operand.is_register)
-            unsupported("unsupported register 0F AE operation");
-
-        auto address = effective_address(operand);
         int operation = (modrm.byte >> 3) & 7;
+        if (modrm.is_register()) {
+            // Register form: LFENCE(5)/MFENCE(6)/SFENCE(7) are memory fences and
+            // are no-ops for this single-threaded interpreter.
+            if (operation >= 5)
+                break;
+            unsupported("unsupported register 0F AE operation");
+        }
+        auto operand = decode_rm_operand(prefixes, modrm);
+        auto address = effective_address(operand);
         if (operation == 0) {
             for (size_t i = 0; i < 512; ++i)
                 m_mmu.write8(address + i, 0);
@@ -1035,14 +1060,19 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         m_gpr_shadow[RAX] = m_gpr_shadow[RBX] = m_gpr_shadow[RCX] = m_gpr_shadow[RDX] = 0;
         break;
     }
-    case 0xa3: {
+    case 0xa3:   // BT
+    case 0xab:   // BTS
+    case 0xb3:   // BTR
+    case 0xbb: { // BTC
         auto modrm = fetch_modrm(prefixes);
         auto bit_base = decode_rm_operand(prefixes, modrm);
         int width = operand_width(prefixes);
         u64 bit_offset = read_gpr(modrm.reg, width, prefixes);
         u64 value = 0;
         int bit_index = 0;
-        if (bit_base.is_register) {
+        u64 address = 0;
+        bool is_memory = !bit_base.is_register;
+        if (!is_memory) {
             value = read_operand(bit_base, width, prefixes);
             bit_index = static_cast<int>(bit_offset & (width - 1));
         } else {
@@ -1053,11 +1083,32 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
                 bit_index += width;
                 --element_offset;
             }
-            u64 address = effective_address(bit_base) + element_offset * (width / 8);
+            address = effective_address(bit_base) + element_offset * (width / 8);
             value = width == 16 ? m_mmu.read16(address) : (width == 32 ? m_mmu.read32(address) : m_mmu.read64(address));
         }
         set_flag(CF, ((value >> bit_index) & 1) != 0);
         m_flags_tainted = m_current_taint;
+
+        // BTS/BTR/BTC also write the modified bit back; BT only reads.
+        u64 bit = static_cast<u64>(1) << bit_index;
+        u64 new_value = value;
+        if (opcode == 0xab)
+            new_value |= bit;
+        else if (opcode == 0xb3)
+            new_value &= ~bit;
+        else if (opcode == 0xbb)
+            new_value ^= bit;
+        if (opcode != 0xa3 && new_value != value) {
+            if (!is_memory) {
+                write_operand(bit_base, width, new_value, prefixes);
+            } else if (width == 16) {
+                m_mmu.write16(address, static_cast<u16>(new_value));
+            } else if (width == 32) {
+                m_mmu.write32(address, static_cast<u32>(new_value));
+            } else {
+                m_mmu.write64(address, new_value);
+            }
+        }
         break;
     }
     case 0xaf: {
@@ -1084,6 +1135,21 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
             set_flag(ZF, false);
         }
         m_flags_tainted = m_current_taint;
+        break;
+    }
+    case 0xc0:
+    case 0xc1: {
+        // XADD r/m, reg: the source register receives the destination's old value
+        // while the destination receives their sum (atomic with a LOCK prefix,
+        // which is a no-op for this single-threaded interpreter).
+        int width = opcode == 0xc0 ? 8 : operand_width(prefixes);
+        auto modrm = fetch_modrm(prefixes);
+        auto destination = decode_rm_operand(prefixes, modrm);
+        u64 destination_value = read_operand(destination, width, prefixes);
+        u64 reg_value = read_gpr(modrm.reg, width, prefixes);
+        u64 sum = add(destination_value, reg_value, width, false);
+        write_gpr(modrm.reg, width, destination_value, prefixes);
+        write_operand(destination, width, sum, prefixes);
         break;
     }
     case 0xb6:
@@ -1260,10 +1326,19 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
     }
     case 0x11:
     case 0x29:
-    case 0x7f: {
+    case 0x7f:
+    case 0xe7: { // 0xe7 = MOVNTDQ (non-temporal store; same effect here)
         auto modrm = fetch_modrm(prefixes);
         auto destination = decode_rm_operand(prefixes, modrm);
         write_xmm_to_operand(destination, xmm(modrm.reg), prefixes);
+        break;
+    }
+    case 0xc3: {
+        // MOVNTI: non-temporal store of a 32/64-bit GPR to memory.
+        auto modrm = fetch_modrm(prefixes);
+        auto destination = decode_rm_operand(prefixes, modrm);
+        int width = operand_width(prefixes);
+        write_operand(destination, width, read_gpr(modrm.reg, width, prefixes), prefixes);
         break;
     }
     case 0x7e: {
@@ -1382,6 +1457,48 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
             for (int b = 0; b < element_size; ++b)
                 destination[static_cast<size_t>(offset + b)] = static_cast<u8>(result >> (b * 8));
         }
+        break;
+    }
+    case 0x64:
+    case 0x65:
+    case 0x66: {
+        // PCMPGTB / PCMPGTW / PCMPGTD: per-lane signed "greater than" producing an
+        // all-ones or all-zero mask, used by glibc's SSE2 sort/compare routines.
+        auto modrm = fetch_modrm(prefixes);
+        auto source = decode_rm_operand(prefixes, modrm);
+        std::array<u8, 16> rhs {};
+        read_xmm_from_operand(source, rhs, prefixes);
+        auto lhs = xmm(modrm.reg);
+        auto& destination = xmm(modrm.reg);
+        int element_size = opcode == 0x64 ? 1 : (opcode == 0x65 ? 2 : 4);
+        int bits = element_size * 8;
+        i64 sign = static_cast<i64>(1) << (bits - 1);
+        for (int offset = 0; offset < 16; offset += element_size) {
+            i64 l = 0;
+            i64 r = 0;
+            for (int b = 0; b < element_size; ++b) {
+                l |= static_cast<i64>(lhs[static_cast<size_t>(offset + b)]) << (b * 8);
+                r |= static_cast<i64>(rhs[static_cast<size_t>(offset + b)]) << (b * 8);
+            }
+            l = (l ^ sign) - sign;
+            r = (r ^ sign) - sign;
+            u8 fill = l > r ? 0xff : 0x00;
+            for (int b = 0; b < element_size; ++b)
+                destination[static_cast<size_t>(offset + b)] = fill;
+        }
+        break;
+    }
+    case 0xda:
+    case 0xde: {
+        // PMINUB / PMAXUB: per-byte unsigned minimum / maximum, used by glibc's
+        // SSE2 string routines (strlen, memchr, ...).
+        auto modrm = fetch_modrm(prefixes);
+        auto source = decode_rm_operand(prefixes, modrm);
+        std::array<u8, 16> rhs {};
+        read_xmm_from_operand(source, rhs, prefixes);
+        auto& destination = xmm(modrm.reg);
+        for (size_t i = 0; i < rhs.size(); ++i)
+            destination[i] = opcode == 0xda ? std::min(destination[i], rhs[i]) : std::max(destination[i], rhs[i]);
         break;
     }
     default:
@@ -2076,9 +2193,9 @@ std::string SoftCPU64::describe_current_instruction() const
             out << "cpuid";
             return with_prefixes(out.str());
         }
-        if (op2 == 0xa3 || op2 == 0xaf || op2 == 0xb0 || op2 == 0xb1 || op2 == 0xbc || op2 == 0xbd || op2 == 0xb6 || op2 == 0xb7 || op2 == 0xbe || op2 == 0xbf) {
+        if (op2 == 0xa3 || op2 == 0xaf || op2 == 0xb0 || op2 == 0xb1 || op2 == 0xc0 || op2 == 0xc1 || op2 == 0xbc || op2 == 0xbd || op2 == 0xb6 || op2 == 0xb7 || op2 == 0xbe || op2 == 0xbf) {
             auto modrm = read_modrm();
-            const char* name = op2 == 0xa3 ? "bt" : op2 == 0xaf ? "imul" : op2 == 0xb0 || op2 == 0xb1 ? "cmpxchg" : op2 == 0xbc ? "bsf" : op2 == 0xbd ? "bsr" : op2 == 0xb6 || op2 == 0xb7 ? "movzx" : "movsx";
+            const char* name = op2 == 0xa3 ? "bt" : op2 == 0xaf ? "imul" : op2 == 0xb0 || op2 == 0xb1 ? "cmpxchg" : op2 == 0xc0 || op2 == 0xc1 ? "xadd" : op2 == 0xbc ? "bsf" : op2 == 0xbd ? "bsr" : op2 == 0xb6 || op2 == 0xb7 ? "movzx" : "movsx";
             out << name << " " << rm_text(modrm, operand_width()) << ", " << reg_text(modrm.reg, operand_width());
             return with_prefixes(out.str());
         }
