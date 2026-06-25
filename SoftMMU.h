@@ -102,11 +102,17 @@ public:
     u16 read16(u64 address) const;
     u32 read32(u64 address) const;
     u64 read64(u64 address) const;
+    ValueWithShadow<u16> read16_with_shadow(u64 address) const;
+    ValueWithShadow<u32> read32_with_shadow(u64 address) const;
+    ValueWithShadow<u64> read64_with_shadow(u64 address) const;
     void write8(u64 address, u8 value);
     void write8_with_shadow(u64 address, ValueWithShadow<u8> value);
     void write16(u64 address, u16 value);
     void write32(u64 address, u32 value);
     void write64(u64 address, u64 value);
+    void write16_with_shadow(u64 address, ValueWithShadow<u16> value);
+    void write32_with_shadow(u64 address, ValueWithShadow<u32> value);
+    void write64_with_shadow(u64 address, ValueWithShadow<u64> value);
     void mark_initialized(u64 address, size_t size, bool initialized);
     void set_write_observer(std::function<void(u64)> observer);
 

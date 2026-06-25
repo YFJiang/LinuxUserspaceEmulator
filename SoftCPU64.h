@@ -4,6 +4,7 @@
 
 #include <array>
 #include <iosfwd>
+#include <set>
 #include <vector>
 
 namespace LUE {
@@ -113,8 +114,15 @@ private:
     u64 read_gpr(int reg, int width, const Prefixes&) const;
     void write_gpr(int reg, int width, u64 value, const Prefixes&);
 
-    void push64(u64 value);
+    // Shadow (taint) tracking. A register byte is "uninitialized" when its shadow
+    // lane is non-zero. These mirror read_gpr/write_gpr's width and high-byte
+    // semantics so register taint follows the same aliasing rules as the value.
+    u64 gpr_shadow(int reg, int width, const Prefixes&) const;
+    void set_gpr_shadow(int reg, int width, u64 shadow, const Prefixes&);
+
+    void push64(u64 value, u64 shadow = 0);
     u64 pop64();
+    ValueWithShadow<u64> pop64_with_shadow();
 
     u64 mask_for_width(int width) const;
     u64 sign_bit_for_width(int width) const;
@@ -124,8 +132,16 @@ private:
     u64 add(u64 lhs, u64 rhs, int width, bool carry);
     u64 sub(u64 lhs, u64 rhs, int width, bool borrow);
     bool condition(int cc) const;
+    bool branch_condition(int cc);
     void set_flag(u64 flag, bool value);
     bool flag(u64 flag) const;
+
+    // Mark the flags as derived from uninitialized data based on the operands read
+    // by the current instruction, so a later conditional branch can be reported.
+    void update_flags_taint();
+    void warn_uninitialized_read(u64 address) const;
+    void warn_uninitialized_pointer(u64 address) const;
+    void warn_uninitialized_branch() const;
 
     void execute_alu_rm_reg(u8 opcode, const Prefixes&);
     void execute_alu_imm(u8 group, const Prefixes&);
@@ -146,6 +162,8 @@ private:
     Emulator& m_emulator;
     SoftMMU& m_mmu;
     std::array<u64, 16> m_gpr {};
+    // Per-register shadow: lane byte non-zero == that register byte is uninitialized.
+    std::array<u64, 16> m_gpr_shadow {};
     std::array<std::array<u8, 16>, 16> m_xmm {};
     u32 m_mxcsr { 0x1f80 };
     u64 m_rip { 0 };
@@ -156,6 +174,16 @@ private:
     u64 m_instruction_start { 0 };
     u64 m_decode_pc { 0 };
     std::vector<u64> m_call_stack;
+
+    // Taint state. m_current_taint accumulates "did any operand read by the
+    // instruction now executing come from uninitialized storage"; it is reset at
+    // the start of every step() and consumed by operand writes. m_flags_tainted is
+    // sticky across instructions, mirroring how the real FLAGS register persists.
+    mutable bool m_current_taint { false };
+    bool m_flags_tainted { false };
+    mutable std::set<u64> m_reported_uninit_reads;
+    mutable std::set<u64> m_reported_uninit_pointers;
+    mutable std::set<u64> m_reported_uninit_branches;
 };
 
 }

@@ -183,6 +183,9 @@ SoftCPU64::DecodedAddress SoftCPU64::decode_memory_address(const Prefixes& prefi
     u64 scale = 1;
     bool has_base = true;
     bool rip_relative = false;
+    // Track whether any register feeding the address is itself uninitialized, so a
+    // dereference through a "wild" pointer can be reported.
+    bool address_tainted = false;
 
     if (rm_low == 4) {
         u8 sib = fetch8();
@@ -190,20 +193,24 @@ SoftCPU64::DecodedAddress SoftCPU64::decode_memory_address(const Prefixes& prefi
         int index_low = (sib >> 3) & 7;
         int base_low = sib & 7;
 
-        if (index_low != 4 || prefixes.rex_x())
+        if (index_low != 4 || prefixes.rex_x()) {
             index = reg(index_low + prefixes.rex_x());
+            address_tainted |= m_gpr_shadow[static_cast<size_t>((index_low + prefixes.rex_x()) & 15)] != 0;
+        }
 
         if (modrm.mod == 0 && base_low == 5) {
             has_base = false;
             displacement = fetch_i32();
         } else {
             base = reg(base_low + prefixes.rex_b());
+            address_tainted |= m_gpr_shadow[static_cast<size_t>((base_low + prefixes.rex_b()) & 15)] != 0;
         }
     } else if (modrm.mod == 0 && rm_low == 5) {
         rip_relative = true;
         displacement = fetch_i32();
     } else {
         base = reg(rm_low + prefixes.rex_b());
+        address_tainted |= m_gpr_shadow[static_cast<size_t>((rm_low + prefixes.rex_b()) & 15)] != 0;
     }
 
     if (modrm.mod == 1)
@@ -223,6 +230,11 @@ SoftCPU64::DecodedAddress SoftCPU64::decode_memory_address(const Prefixes& prefi
         address += m_fs_base;
     else if (prefixes.segment == 65)
         address += m_gs_base;
+    if (address_tainted) {
+        warn_uninitialized_pointer(address);
+        // A value reached through an uninitialized pointer is itself meaningless.
+        m_current_taint = true;
+    }
     return DecodedAddress { address, rip_relative, displacement };
 }
 
@@ -271,6 +283,10 @@ u64 SoftCPU64::sign_extend(u64 value, int width) const
 
 u64 SoftCPU64::read_gpr(int register_index, int width, const Prefixes& prefixes) const
 {
+    // Reading a register feeds the current instruction: if any consumed byte is
+    // uninitialized, the instruction's result is considered uninitialized too.
+    if (gpr_shadow(register_index, width, prefixes))
+        m_current_taint = true;
     register_index &= 15;
     if (width == 8) {
         if (!prefixes.rex_present && register_index >= 4 && register_index <= 7)
@@ -286,6 +302,10 @@ u64 SoftCPU64::read_gpr(int register_index, int width, const Prefixes& prefixes)
 
 void SoftCPU64::write_gpr(int register_index, int width, u64 value, const Prefixes& prefixes)
 {
+    // The destination inherits the taint accumulated while reading this
+    // instruction's source operands (whole-result taint). Writing a value that
+    // depended on nothing uninitialized clears the register's shadow.
+    set_gpr_shadow(register_index, width, m_current_taint ? mask_for_width(width) : 0, prefixes);
     register_index &= 15;
     value &= mask_for_width(width);
     auto& target = m_gpr[static_cast<size_t>(register_index)];
@@ -309,18 +329,71 @@ void SoftCPU64::write_gpr(int register_index, int width, u64 value, const Prefix
     target = value;
 }
 
+// Read a register's shadow word, masked to the accessed width and honoring the
+// same legacy high-byte (ah/ch/dh/bh) aliasing as read_gpr.
+u64 SoftCPU64::gpr_shadow(int register_index, int width, const Prefixes& prefixes) const
+{
+    register_index &= 15;
+    if (width == 8) {
+        if (!prefixes.rex_present && register_index >= 4 && register_index <= 7)
+            return (m_gpr_shadow[static_cast<size_t>(register_index - 4)] >> 8) & 0xff;
+        return m_gpr_shadow[static_cast<size_t>(register_index)] & 0xff;
+    }
+    if (width == 16)
+        return m_gpr_shadow[static_cast<size_t>(register_index)] & 0xffff;
+    if (width == 32)
+        return m_gpr_shadow[static_cast<size_t>(register_index)] & 0xffffffffULL;
+    return m_gpr_shadow[static_cast<size_t>(register_index)];
+}
+
+// Update a register's shadow word, mirroring write_gpr exactly so taint follows
+// the same width and zero-extension rules as the value it shadows.
+void SoftCPU64::set_gpr_shadow(int register_index, int width, u64 shadow, const Prefixes& prefixes)
+{
+    register_index &= 15;
+    shadow &= mask_for_width(width);
+    auto& target = m_gpr_shadow[static_cast<size_t>(register_index)];
+    if (width == 8) {
+        if (!prefixes.rex_present && register_index >= 4 && register_index <= 7) {
+            auto& high_target = m_gpr_shadow[static_cast<size_t>(register_index - 4)];
+            high_target = (high_target & ~0xff00ULL) | (shadow << 8);
+            return;
+        }
+        target = (target & ~0xffULL) | shadow;
+        return;
+    }
+    if (width == 16) {
+        target = (target & ~0xffffULL) | shadow;
+        return;
+    }
+    // 32-bit writes zero-extend into the full 64-bit register; the upper half
+    // becomes a defined zero, so its shadow clears too.
+    target = shadow;
+}
+
 u64 SoftCPU64::read_operand(const Operand& operand, int width, const Prefixes& prefixes) const
 {
     if (operand.is_register)
         return read_gpr(operand.reg, width, prefixes);
     auto address = effective_address(operand);
-    if (width == 8)
-        return m_mmu.read8(address);
-    if (width == 16)
-        return m_mmu.read16(address);
-    if (width == 32)
-        return m_mmu.read32(address);
-    return m_mmu.read64(address);
+    ValueWithShadow<u64> read;
+    if (width == 8) {
+        auto byte = m_mmu.read8_with_shadow(address);
+        read = ValueWithShadow<u64>(byte.value(), byte.is_uninitialized() ? 0xff : 0);
+    } else if (width == 16) {
+        auto word = m_mmu.read16_with_shadow(address);
+        read = ValueWithShadow<u64>(word.value(), word.shadow());
+    } else if (width == 32) {
+        auto dword = m_mmu.read32_with_shadow(address);
+        read = ValueWithShadow<u64>(dword.value(), dword.shadow());
+    } else {
+        read = m_mmu.read64_with_shadow(address);
+    }
+    if (read.is_uninitialized()) {
+        m_current_taint = true;
+        warn_uninitialized_read(address);
+    }
+    return read.value();
 }
 
 void SoftCPU64::write_operand(const Operand& operand, int width, u64 value, const Prefixes& prefixes)
@@ -331,25 +404,31 @@ void SoftCPU64::write_operand(const Operand& operand, int width, u64 value, cons
         return;
     }
     auto address = effective_address(operand);
+    bool tainted = m_current_taint;
     if (width == 8)
-        m_mmu.write8(address, static_cast<u8>(value));
+        m_mmu.write8_with_shadow(address, ValueWithShadow<u8>(static_cast<u8>(value), tainted ? 0xff : 0));
     else if (width == 16)
-        m_mmu.write16(address, static_cast<u16>(value));
+        m_mmu.write16_with_shadow(address, ValueWithShadow<u16>(static_cast<u16>(value), tainted ? 0xffff : 0));
     else if (width == 32)
-        m_mmu.write32(address, static_cast<u32>(value));
+        m_mmu.write32_with_shadow(address, ValueWithShadow<u32>(static_cast<u32>(value), tainted ? 0xffffffffULL : 0));
     else
-        m_mmu.write64(address, value);
+        m_mmu.write64_with_shadow(address, ValueWithShadow<u64>(value, tainted ? ~0ULL : 0));
 }
 
-void SoftCPU64::push64(u64 value)
+void SoftCPU64::push64(u64 value, u64 shadow)
 {
     m_gpr[RSP] -= 8;
-    m_mmu.write64(m_gpr[RSP], value);
+    m_mmu.write64_with_shadow(m_gpr[RSP], ValueWithShadow<u64>(value, shadow));
 }
 
 u64 SoftCPU64::pop64()
 {
-    auto value = m_mmu.read64(m_gpr[RSP]);
+    return pop64_with_shadow().value();
+}
+
+ValueWithShadow<u64> SoftCPU64::pop64_with_shadow()
+{
+    auto value = m_mmu.read64_with_shadow(m_gpr[RSP]);
     m_gpr[RSP] += 8;
     return value;
 }
@@ -375,6 +454,15 @@ void SoftCPU64::set_logic_flags(u64 result, int width)
     set_flag(SF, result & sign_bit_for_width(width));
     set_flag(ZF, result == 0);
     set_flag(PF, parity_even(static_cast<u8>(result)));
+    update_flags_taint();
+}
+
+// The flags just computed are uninitialized if any operand the instruction read
+// was uninitialized. Flags are sticky, so this also *clears* the taint when the
+// inputs were all defined.
+void SoftCPU64::update_flags_taint()
+{
+    m_flags_tainted = m_current_taint;
 }
 
 u64 SoftCPU64::add(u64 lhs, u64 rhs, int width, bool carry)
@@ -389,6 +477,7 @@ u64 SoftCPU64::add(u64 lhs, u64 rhs, int width, bool carry)
     set_flag(ZF, result == 0);
     set_flag(PF, parity_even(static_cast<u8>(result)));
     set_flag(OF, (~(lhs ^ rhs) & (lhs ^ result) & sign_bit_for_width(width)) != 0);
+    update_flags_taint();
     return result;
 }
 
@@ -404,6 +493,7 @@ u64 SoftCPU64::sub(u64 lhs, u64 rhs, int width, bool borrow)
     set_flag(ZF, result == 0);
     set_flag(PF, parity_even(static_cast<u8>(result)));
     set_flag(OF, ((lhs ^ rhs) & (lhs ^ result) & sign_bit_for_width(width)) != 0);
+    update_flags_taint();
     return result;
 }
 
@@ -446,6 +536,41 @@ bool SoftCPU64::condition(int cc) const
     return false;
 }
 
+// Evaluate a conditional-branch predicate, reporting once per site if the flags
+// it depends on were derived from uninitialized data.
+bool SoftCPU64::branch_condition(int cc)
+{
+    if (m_flags_tainted)
+        warn_uninitialized_branch();
+    return condition(cc);
+}
+
+void SoftCPU64::warn_uninitialized_read(u64 address) const
+{
+    if (!m_reported_uninit_reads.insert(m_instruction_start).second)
+        return;
+    std::cerr << "uninitialized guest memory read at " << hex(address)
+              << " (used at " << hex(m_instruction_start, 12) << ")\n";
+}
+
+void SoftCPU64::warn_uninitialized_pointer(u64 address) const
+{
+    if (!m_reported_uninit_pointers.insert(m_instruction_start).second)
+        return;
+    std::cerr << "uninitialized guest memory read: address computed from "
+                 "uninitialized value at "
+              << hex(m_instruction_start, 12) << " (effective address " << hex(address) << ")\n";
+}
+
+void SoftCPU64::warn_uninitialized_branch() const
+{
+    if (!m_reported_uninit_branches.insert(m_instruction_start).second)
+        return;
+    std::cerr << "uninitialized guest memory read: conditional branch depends on "
+                 "uninitialized value at "
+              << hex(m_instruction_start, 12) << "\n";
+}
+
 void SoftCPU64::execute_alu_rm_reg(u8 opcode, const Prefixes& prefixes)
 {
     int operation = opcode >> 3;
@@ -460,6 +585,14 @@ void SoftCPU64::execute_alu_rm_reg(u8 opcode, const Prefixes& prefixes)
     u64 lhs = read_operand(destination, width, prefixes);
     u64 rhs = read_operand(source, width, prefixes);
     u64 result = 0;
+
+    // `xor reg, reg`, `sub reg, reg` and `cmp reg, reg` produce a result that does
+    // not depend on the register's prior contents (0, 0, and "equal"), so they are
+    // defined even when the register was uninitialized. This is an extremely common
+    // zeroing idiom, so treating it as tainted would be a constant false positive.
+    if (destination.is_register && source.is_register && destination.reg == source.reg
+        && (operation == 5 || operation == 6 || operation == 7))
+        m_current_taint = false;
 
     switch (operation) {
     case 0:
@@ -583,7 +716,8 @@ void SoftCPU64::execute_group_ff(const Prefixes& prefixes)
         return;
     }
     if (operation == 6) {
-        push64(read_operand(operand, 64, prefixes));
+        u64 value = read_operand(operand, 64, prefixes);
+        push64(value, m_current_taint ? ~0ULL : 0);
         return;
     }
     unsupported("unsupported FF group operation");
@@ -771,7 +905,7 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
 
     if (opcode >= 0x80 && opcode <= 0x8f) {
         i32 rel = fetch_i32();
-        if (condition(opcode & 0xf))
+        if (branch_condition(opcode & 0xf))
             m_decode_pc = m_decode_pc + rel;
         return;
     }
@@ -779,6 +913,9 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
     if (opcode >= 0x90 && opcode <= 0x9f) {
         auto modrm = fetch_modrm(prefixes);
         auto operand = decode_rm_operand(prefixes, modrm);
+        // A flag-derived result is uninitialized when the flags were.
+        if (m_flags_tainted)
+            m_current_taint = true;
         write_operand(operand, 8, condition(opcode & 0xf) ? 1 : 0, prefixes);
         return;
     }
@@ -787,6 +924,8 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         auto modrm = fetch_modrm(prefixes);
         auto source = decode_rm_operand(prefixes, modrm);
         int width = operand_width(prefixes);
+        if (m_flags_tainted)
+            m_current_taint = true;
         if (condition(opcode & 0xf))
             write_gpr(modrm.reg, width, read_operand(source, width, prefixes), prefixes);
         return;
@@ -797,12 +936,15 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         u64 next_rip = m_decode_pc;
         m_gpr[RCX] = next_rip;
         m_gpr[R11] = m_rflags;
+        m_gpr_shadow[RCX] = 0;
+        m_gpr_shadow[R11] = 0;
         u64 result = m_emulator.handle_syscall(m_gpr[RAX]);
         if (m_emulator.consume_restored_context_from_sigreturn()) {
             m_decode_pc = m_rip;
             break;
         }
         m_gpr[RAX] = result;
+        m_gpr_shadow[RAX] = 0;
         m_decode_pc = next_rip;
         break;
     }
@@ -820,6 +962,8 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         m_gpr[RAX] = static_cast<u32>(now);
         m_gpr[RDX] = static_cast<u32>(static_cast<u64>(now) >> 32);
+        m_gpr_shadow[RAX] = 0;
+        m_gpr_shadow[RDX] = 0;
         break;
     }
     case 0xae: {
@@ -888,6 +1032,7 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         } else {
             m_gpr[RAX] = m_gpr[RBX] = m_gpr[RCX] = m_gpr[RDX] = 0;
         }
+        m_gpr_shadow[RAX] = m_gpr_shadow[RBX] = m_gpr_shadow[RCX] = m_gpr_shadow[RDX] = 0;
         break;
     }
     case 0xa3: {
@@ -912,6 +1057,7 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
             value = width == 16 ? m_mmu.read16(address) : (width == 32 ? m_mmu.read32(address) : m_mmu.read64(address));
         }
         set_flag(CF, ((value >> bit_index) & 1) != 0);
+        m_flags_tainted = m_current_taint;
         break;
     }
     case 0xaf: {
@@ -937,6 +1083,7 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
             write_gpr(RAX, width, destination_value, prefixes);
             set_flag(ZF, false);
         }
+        m_flags_tainted = m_current_taint;
         break;
     }
     case 0xb6:
@@ -974,6 +1121,7 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
             }
             write_gpr(modrm.reg, width, static_cast<u64>(index), prefixes);
         }
+        m_flags_tainted = m_current_taint;
         break;
     }
     case 0x10:
@@ -1267,14 +1415,18 @@ void SoftCPU64::execute_string_instruction(u8 opcode, const Prefixes& prefixes)
             m_gpr[RDI] += step;
         }
     }
-    if (prefixes.repz)
+    if (prefixes.repz) {
         m_gpr[RCX] = 0;
+        m_gpr_shadow[RCX] = 0;
+    }
 }
 
 void SoftCPU64::step()
 {
     m_instruction_start = m_rip;
     m_decode_pc = m_rip;
+    // Taint accumulated by source-operand reads applies only to this instruction.
+    m_current_taint = false;
     auto prefixes = read_prefixes();
     u8 opcode = fetch8();
 
@@ -1340,7 +1492,7 @@ void SoftCPU64::step()
 
     if (opcode >= 0x70 && opcode <= 0x7f) {
         i8 rel = fetch_i8();
-        if (condition(opcode & 0xf))
+        if (branch_condition(opcode & 0xf))
             m_decode_pc = m_decode_pc + rel;
         m_rip = m_decode_pc;
         return;
@@ -1349,9 +1501,8 @@ void SoftCPU64::step()
     if (opcode >= 0x90 && opcode <= 0x97) {
         int other = (opcode & 7) + prefixes.rex_b();
         if (other != RAX) {
-            u64 tmp = m_gpr[RAX];
-            m_gpr[RAX] = m_gpr[other];
-            m_gpr[other] = tmp;
+            std::swap(m_gpr[RAX], m_gpr[other]);
+            std::swap(m_gpr_shadow[RAX], m_gpr_shadow[other]);
         }
         m_rip = m_decode_pc;
         return;
@@ -1376,13 +1527,17 @@ void SoftCPU64::step()
     }
 
     if (opcode >= 0x50 && opcode <= 0x57) {
-        push64(m_gpr[(opcode - 0x50) + prefixes.rex_b()]);
+        int source = (opcode - 0x50) + prefixes.rex_b();
+        push64(m_gpr[static_cast<size_t>(source)], m_gpr_shadow[static_cast<size_t>(source)]);
         m_rip = m_decode_pc;
         return;
     }
 
     if (opcode >= 0x58 && opcode <= 0x5f) {
-        m_gpr[(opcode - 0x58) + prefixes.rex_b()] = pop64();
+        int target = (opcode - 0x58) + prefixes.rex_b();
+        auto value = pop64_with_shadow();
+        m_gpr[static_cast<size_t>(target)] = value.value();
+        m_gpr_shadow[static_cast<size_t>(target)] = value.is_uninitialized() ? ~0ULL : 0;
         m_rip = m_decode_pc;
         return;
     }
@@ -1466,20 +1621,29 @@ void SoftCPU64::step()
         if (((modrm.byte >> 3) & 7) != 0)
             unsupported("unsupported 8F group operation");
         auto destination = decode_rm_operand(prefixes, modrm);
-        write_operand(destination, 64, pop64(), prefixes);
+        auto value = pop64_with_shadow();
+        if (value.is_uninitialized())
+            m_current_taint = true;
+        write_operand(destination, 64, value.value(), prefixes);
         break;
     }
     case 0x98:
-        if (prefixes.rex_w())
-            m_gpr[RAX] = sign_extend(static_cast<u32>(m_gpr[RAX]), 32);
-        else
-            write_gpr(RAX, 32, sign_extend(static_cast<u16>(m_gpr[RAX]), 16), prefixes);
+        if (prefixes.rex_w()) {
+            u64 value = read_gpr(RAX, 32, prefixes);
+            m_gpr[RAX] = sign_extend(value, 32);
+            m_gpr_shadow[RAX] = m_current_taint ? ~0ULL : 0;
+        } else {
+            write_gpr(RAX, 32, sign_extend(read_gpr(RAX, 16, prefixes), 16), prefixes);
+        }
         break;
     case 0x99:
-        if (prefixes.rex_w())
-            m_gpr[RDX] = (m_gpr[RAX] & (1ULL << 63)) ? ~0ULL : 0;
-        else
-            write_gpr(RDX, 32, (m_gpr[RAX] & (1U << 31)) ? 0xffffffffU : 0, prefixes);
+        if (prefixes.rex_w()) {
+            bool sign = (read_gpr(RAX, 64, prefixes) & (1ULL << 63)) != 0;
+            m_gpr[RDX] = sign ? ~0ULL : 0;
+            m_gpr_shadow[RDX] = m_current_taint ? ~0ULL : 0;
+        } else {
+            write_gpr(RDX, 32, (read_gpr(RAX, 32, prefixes) & (1U << 31)) ? 0xffffffffU : 0, prefixes);
+        }
         break;
     case 0xa4:
     case 0xa5:
@@ -1488,7 +1652,7 @@ void SoftCPU64::step()
         execute_string_instruction(opcode, prefixes);
         break;
     case 0xa8:
-        set_logic_flags((m_gpr[RAX] & 0xff) & fetch8(), 8);
+        set_logic_flags(read_gpr(RAX, 8, prefixes) & fetch8(), 8);
         break;
     case 0xa9:
         set_logic_flags(read_gpr(RAX, operand_width(prefixes), prefixes) & (prefixes.rex_w() ? sign_extend(fetch32(), 32) : fetch32()), operand_width(prefixes));
@@ -1526,10 +1690,14 @@ void SoftCPU64::step()
         write_operand(destination, width, value, prefixes);
         break;
     }
-    case 0xc9:
+    case 0xc9: {
         m_gpr[RSP] = m_gpr[RBP];
-        m_gpr[RBP] = pop64();
+        m_gpr_shadow[RSP] = m_gpr_shadow[RBP];
+        auto value = pop64_with_shadow();
+        m_gpr[RBP] = value.value();
+        m_gpr_shadow[RBP] = value.is_uninitialized() ? ~0ULL : 0;
         break;
+    }
     case 0xe0:
     case 0xe1:
     case 0xe2: {

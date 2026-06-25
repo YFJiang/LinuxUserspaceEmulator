@@ -373,15 +373,17 @@ SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot)
     return *region;
 }
 
-// Read an initialized byte from guest memory.
+// Read a byte from guest memory, ignoring its shadow initialization state.
+//
+// Reading uninitialized memory is no longer fatal here: the byte value is real
+// (regions are backed by concrete storage) and callers that care about taint use
+// the *_with_shadow variants. The SoftCPU layer decides when an uninitialized
+// value is actually *used* in a meaningful way (as a pointer or a branch
+// condition) and reports it there, so a single uninitialized read no longer
+// aborts the whole guest.
 u8 SoftMMU::read8(u64 address) const
 {
-    auto value = read8_with_shadow(address);
-    if (value.is_uninitialized()) {
-        std::cerr << "uninitialized guest memory read at " << hex(address) << "\n";
-        throw EmulatorError("uninitialized guest memory read at " + hex(address));
-    }
-    return value.value();
+    return read8_with_shadow(address).value();
 }
 
 // Read a byte from guest memory while preserving shadow initialization state.
@@ -418,6 +420,53 @@ u64 SoftMMU::read64(u64 address) const
     return value;
 }
 
+namespace {
+// Assemble a multi-byte value together with a per-byte shadow word, where each
+// uninitialized byte contributes 0xff in its lane (so shadow != 0 means "some
+// byte was uninitialized").
+template<typename T>
+ValueWithShadow<T> read_with_shadow(const SoftMMU& mmu, u64 address)
+{
+    T value {};
+    T shadow {};
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        auto byte = mmu.read8_with_shadow(address + i);
+        value |= static_cast<T>(byte.value()) << (i * 8);
+        if (byte.is_uninitialized())
+            shadow |= static_cast<T>(0xff) << (i * 8);
+    }
+    return ValueWithShadow<T>(value, shadow);
+}
+
+template<typename T>
+void write_with_shadow(SoftMMU& mmu, u64 address, ValueWithShadow<T> value)
+{
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        auto byte = static_cast<u8>(value.value() >> (i * 8));
+        auto byte_shadow = static_cast<u8>(value.shadow() >> (i * 8));
+        mmu.write8_with_shadow(address + i, ValueWithShadow<u8>(byte, byte_shadow));
+    }
+}
+}
+
+// Read a little-endian 16-bit value while preserving per-byte shadow state.
+ValueWithShadow<u16> SoftMMU::read16_with_shadow(u64 address) const
+{
+    return read_with_shadow<u16>(*this, address);
+}
+
+// Read a little-endian 32-bit value while preserving per-byte shadow state.
+ValueWithShadow<u32> SoftMMU::read32_with_shadow(u64 address) const
+{
+    return read_with_shadow<u32>(*this, address);
+}
+
+// Read a little-endian 64-bit value while preserving per-byte shadow state.
+ValueWithShadow<u64> SoftMMU::read64_with_shadow(u64 address) const
+{
+    return read_with_shadow<u64>(*this, address);
+}
+
 // Write an initialized byte to guest memory.
 void SoftMMU::write8(u64 address, u8 value)
 {
@@ -452,6 +501,24 @@ void SoftMMU::write64(u64 address, u64 value)
 {
     for (size_t i = 0; i < sizeof(value); ++i)
         write8(address + i, static_cast<u8>(value >> (i * 8)));
+}
+
+// Write a little-endian 16-bit value while propagating per-byte shadow state.
+void SoftMMU::write16_with_shadow(u64 address, ValueWithShadow<u16> value)
+{
+    write_with_shadow<u16>(*this, address, value);
+}
+
+// Write a little-endian 32-bit value while propagating per-byte shadow state.
+void SoftMMU::write32_with_shadow(u64 address, ValueWithShadow<u32> value)
+{
+    write_with_shadow<u32>(*this, address, value);
+}
+
+// Write a little-endian 64-bit value while propagating per-byte shadow state.
+void SoftMMU::write64_with_shadow(u64 address, ValueWithShadow<u64> value)
+{
+    write_with_shadow<u64>(*this, address, value);
 }
 
 // Mark a guest byte range as initialized or uninitialized.

@@ -20,7 +20,9 @@ Currently supported:
 - common file, time, polling, socket, and signal syscalls
 - basic guest signal handling and host signal forwarding
 - symbolic guest backtraces for loaded ELF images
-- basic byte-level shadow memory for initialized guest memory tracking
+- byte-level shadow memory plus register/flags taint propagation, with non-fatal
+  reports for uninitialized memory reads, uninitialized pointer dereferences, and
+  conditional branches that depend on uninitialized data
 - basic malloc tracing for leaks, heap overflow writes, and use-after-free writes
 
 Known limitations:
@@ -28,7 +30,8 @@ Known limitations:
 - incomplete x86_64 instruction coverage
 - no thread or process model for `clone`, `fork`, or `execve`
 - no full POSIX signal semantics
-- no full CPU taint propagation or production-grade heap sanitizer
+- taint propagation is whole-result (not bit-precise) and does not cover the
+  x87/SSE register file; no production-grade heap sanitizer
 - no security isolation guarantee
 
 ## Build

@@ -18,6 +18,7 @@ cc -static -O0 -o /tmp/lue-syscall-coverage "$repo_dir/tests/syscall-coverage.c"
 cc -static -O0 -o /tmp/lue-region-types "$repo_dir/tests/region-types.c"
 cc -static -O0 -o /tmp/lue-region-dump "$repo_dir/tests/region-dump.c"
 cc -static -O0 -o /tmp/lue-shadow-memory "$repo_dir/tests/shadow-memory.c"
+cc -static -O0 -o /tmp/lue-uninitialized-branch "$repo_dir/tests/uninitialized-branch.c"
 cc -O0 -o /tmp/lue-malloc-tracer "$repo_dir/tests/malloc-tracer.c"
 cc -O0 -o /tmp/lue-signal-basic "$repo_dir/tests/signal-basic.c"
 cc -O0 -o /tmp/lue-host-signal "$repo_dir/tests/host-signal.c"
@@ -116,6 +117,24 @@ run_and_check_failure_output_contains() {
     printf 'PASS %s\n' "$name"
 }
 
+run_and_check_success_output_contains() {
+    local name="$1"
+    local expected="$2"
+    shift 2
+
+    local output status
+    set +e
+    output="$("$@" 2>&1)"
+    status=$?
+    set -e
+
+    if [[ "$status" != 0 || "$output" != *"$expected"* ]]; then
+        printf 'FAIL %s\nstatus: %s\nexpected success with output containing:\n%s\nactual output:\n%s\n' "$name" "$status" "$expected" "$output" >&2
+        return 1
+    fi
+    printf 'PASS %s\n' "$name"
+}
+
 run_and_check_host_signal() {
     local name="$1"
     local stdout_file stderr_file pid status output
@@ -195,7 +214,8 @@ run_and_check mmap-brk $'heap ok\nmmap ok' "$emulator" /tmp/lue-mmap-brk
 run_and_check syscall-coverage "syscall coverage ok" "$emulator" /tmp/lue-syscall-coverage
 run_and_check region-types $'LEft\nRIght' "$emulator" /tmp/lue-region-types
 run_and_check_failure_output_contains region-dump "mmap [mmap]" "$emulator" /tmp/lue-region-dump
-run_and_check_failure_output_contains shadow-memory "uninitialized guest memory read" "$emulator" /tmp/lue-shadow-memory
+run_and_check_success_output_contains shadow-memory "uninitialized guest memory read" "$emulator" /tmp/lue-shadow-memory
+run_and_check_success_output_contains uninitialized-branch "conditional branch depends on uninitialized value" "$emulator" /tmp/lue-uninitialized-branch
 run_and_check_malloc_tracer malloc-tracer
 run_and_check signal-basic $'before\nhandled\nafter' "$emulator" /tmp/lue-signal-basic
 run_and_check_host_signal host-signal
