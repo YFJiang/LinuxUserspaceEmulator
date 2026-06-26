@@ -16,7 +16,7 @@ Currently supported:
 
 - static Linux x86_64 ELF programs
 - simple dynamically linked glibc programs
-- basic virtual memory, `brk`, `mmap`, and file-backed mappings
+- basic virtual memory, `brk`, `mmap`, `mremap`, and file-backed mappings
 - common file, time, polling, socket, and signal syscalls
 - basic guest signal handling and host signal forwarding
 - symbolic guest backtraces for loaded ELF images
@@ -29,12 +29,9 @@ Known limitations:
 
 - incomplete x86_64 instruction coverage
 - no thread or process model for `clone`, `fork`, or `execve`
-- no full POSIX signal semantics
-- no `mremap` (syscall 25), so guests that grow a mapping in place are
-  unsupported; e.g. `ls` on a very large directory fails because glibc uses
-  `mremap` to grow its `getdents` buffer
 - taint propagation is whole-result (not bit-precise) and does not cover the
   x87/SSE register file; no production-grade heap sanitizer
+- no full POSIX signal semantics
 - no security isolation guarantee
 
 ## Build
@@ -81,9 +78,9 @@ bash tests/run-smoke.sh
 ```
 
 The smoke suite builds small guest programs and checks static ELF loading,
-dynamic glibc startup, arguments and environment, file I/O, `mmap`/`brk`, signal
-delivery, host signal forwarding, syscall coverage, TLS basics, and symbolic
-backtraces.
+dynamic glibc startup, arguments and environment, file I/O, `mmap`/`mremap`/`brk`,
+signal delivery, host signal forwarding, syscall coverage, TLS basics, and
+symbolic backtraces.
 
 ## Notes
 

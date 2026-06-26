@@ -1221,19 +1221,23 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
     }
     case 0x60:
     case 0x61:
-    case 0x62: {
+    case 0x62:
+    case 0x68:
+    case 0x69:
+    case 0x6a: {
         auto modrm = fetch_modrm(prefixes);
         auto source = decode_rm_operand(prefixes, modrm);
         std::array<u8, 16> rhs {};
         read_xmm_from_operand(source, rhs, prefixes);
         auto lhs = xmm(modrm.reg);
         auto& destination = xmm(modrm.reg);
-        int element_size = opcode == 0x60 ? 1 : (opcode == 0x61 ? 2 : 4);
+        int element_size = (opcode & 3) == 0 ? 1 : ((opcode & 3) == 1 ? 2 : 4);
+        int start_offset = (opcode & 8) ? 8 : 0;
         int elements = 8 / element_size;
         for (int lane = 0; lane < elements; ++lane) {
             for (int b = 0; b < element_size; ++b) {
-                destination[static_cast<size_t>(lane * element_size * 2 + b)] = lhs[static_cast<size_t>(lane * element_size + b)];
-                destination[static_cast<size_t>(lane * element_size * 2 + element_size + b)] = rhs[static_cast<size_t>(lane * element_size + b)];
+                destination[static_cast<size_t>(lane * element_size * 2 + b)] = lhs[static_cast<size_t>(start_offset + lane * element_size + b)];
+                destination[static_cast<size_t>(lane * element_size * 2 + element_size + b)] = rhs[static_cast<size_t>(start_offset + lane * element_size + b)];
             }
         }
         break;
@@ -1311,16 +1315,18 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         }
         break;
     }
-    case 0x6c: {
+    case 0x6c:
+    case 0x6d: {
         auto modrm = fetch_modrm(prefixes);
         auto source = decode_rm_operand(prefixes, modrm);
         std::array<u8, 16> rhs {};
         read_xmm_from_operand(source, rhs, prefixes);
         auto lhs = xmm(modrm.reg);
         auto& destination = xmm(modrm.reg);
+        int offset = opcode == 0x6c ? 0 : 8;
         for (int i = 0; i < 8; ++i) {
-            destination[static_cast<size_t>(i)] = lhs[static_cast<size_t>(i)];
-            destination[static_cast<size_t>(8 + i)] = rhs[static_cast<size_t>(i)];
+            destination[static_cast<size_t>(i)] = lhs[static_cast<size_t>(offset + i)];
+            destination[static_cast<size_t>(8 + i)] = rhs[static_cast<size_t>(offset + i)];
         }
         break;
     }

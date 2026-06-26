@@ -198,6 +198,10 @@ const char* syscall_name(u64 number)
     case SYS_mprotect:
         return "mprotect";
 #endif
+#ifdef SYS_mremap
+    case SYS_mremap:
+        return "mremap";
+#endif
 #ifdef SYS_brk
     case SYS_brk:
         return "brk";
@@ -1058,6 +1062,97 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         return 0;
 #endif
 
+#ifdef SYS_mremap
+    case SYS_mremap: {
+        // mremap(old_addr, old_size, new_size, flags[, new_addr])
+        // arg1=old_addr  arg2=old_size  arg3=new_size  arg4=flags  arg5=new_addr
+        u64 old_addr = arg1;
+        u64 old_size = page_align_up(arg2);
+        u64 new_size = page_align_up(arg3);
+        u64 flags    = arg4;
+        u64 new_addr = arg5;  // only meaningful when MREMAP_FIXED is set
+
+        bool may_move     = flags & MREMAP_MAYMOVE;
+        bool fixed        = flags & MREMAP_FIXED;
+        bool dont_unmap   = flags & MREMAP_DONTUNMAP;
+
+        // MREMAP_FIXED requires MREMAP_MAYMOVE.
+        if (fixed && !may_move)
+            return syscall_error(EINVAL);
+
+        // old_addr must be page-aligned.
+        if (old_addr & (page_size - 1))
+            return syscall_error(EINVAL);
+
+        // The old range must be mapped.
+        if (!mmu.is_mapped(old_addr, old_size ? old_size : 1))
+            return syscall_error(EFAULT);
+
+        // --- Shrink in-place (no data movement needed) ---
+        if (new_size < old_size && !fixed) {
+            mmu.unmap(old_addr + new_size, old_size - new_size);
+            return old_addr;
+        }
+
+        // --- Same size, no-op (unless MREMAP_FIXED forces a move) ---
+        if (new_size == old_size && !fixed)
+            return old_addr;
+
+        // --- Determine destination address ---
+        u64 dest_addr;
+        if (fixed) {
+            // Caller specifies the exact new address.
+            dest_addr = page_align_down(new_addr);
+            // The new range must not overlap the old range (unless MREMAP_DONTUNMAP).
+            bool overlap = (dest_addr < old_addr + old_size) && (dest_addr + new_size > old_addr);
+            if (!dont_unmap && overlap)
+                return syscall_error(EINVAL);
+            // Unmap whatever currently lives at the destination.
+            mmu.unmap(dest_addr, new_size);
+        } else if (may_move) {
+            // Let the MMU pick a free slot.
+            // We will allocate below after we know the region kind.
+            dest_addr = 0;  // placeholder; set after probing the old region
+        } else {
+            // Cannot move and the mapping would grow — fail.
+            return syscall_error(ENOMEM);
+        }
+
+        // --- Collect old-region metadata by reading the first byte's region ---
+        // We use find_region to discover what kind the source region is so we
+        // can preserve its name and permissions.
+        const SoftMMU::Region* src_region = mmu.find_region(old_addr);
+        if (!src_region)
+            return syscall_error(EFAULT);
+
+        int  src_prot = src_region->prot;
+        std::string src_name = src_region->name;
+
+        // --- Allocate destination if MREMAP_MAYMOVE without MREMAP_FIXED ---
+        if (!fixed) {
+            dest_addr = mmu.allocate_mmap(new_size, page_size, src_prot, src_name);
+        } else {
+            // For MREMAP_FIXED we already unmapped dest; now create the region.
+            mmu.map_mmap(dest_addr, new_size, src_prot, src_name);
+        }
+
+        // --- Copy content from old mapping into the new one ---
+        u64 copy_size = std::min(old_size, new_size);
+        for (u64 i = 0; i < copy_size; ++i) {
+            auto byte = mmu.read8_with_shadow(old_addr + i);
+            mmu.write8_with_shadow(dest_addr + i, byte);
+        }
+        // Bytes beyond old_size in the new region are already zero-initialized
+        // by map_mmap / map_zeroed.
+
+        // --- Remove the old mapping unless MREMAP_DONTUNMAP ---
+        if (!dont_unmap)
+            mmu.unmap(old_addr, old_size);
+
+        return dest_addr;
+    }
+#endif
+
 #ifdef SYS_brk
     case SYS_brk:
         return emulator.set_brk(arg1);
@@ -1158,8 +1253,36 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         if (arg3 == 0)
             return syscall_result(::ioctl(static_cast<int>(arg1), static_cast<unsigned long>(arg2), 0));
         std::array<u8, 256> scratch {};
+        size_t size = 0;
+        if ((arg2 & 0xff00) == 0x5400) {
+            switch (arg2) {
+            case 0x5401: // TCGETS
+            case 0x5402: // TCSETS
+            case 0x5403: // TCSETSW
+            case 0x5404: // TCSETSF
+                size = 60; // sizeof(struct termios)
+                break;
+            case 0x5405: // TCGETA
+            case 0x5406: // TCSETA
+            case 0x5407: // TCSETAW
+            case 0x5408: // TCSETAF
+                size = 18; // sizeof(struct termio)
+                break;
+            case 0x5413: // TIOCGWINSZ
+            case 0x5414: // TIOCSWINSZ
+                size = 8; // sizeof(struct winsize)
+                break;
+            default:
+                size = 60; // default safe size for legacy terminal ioctls
+                break;
+            }
+        } else {
+            size = (arg2 >> 16) & 0x3fff;
+            if (size == 0)
+                size = 8;
+        }
+        size_t copy_size = std::min<size_t>(scratch.size(), size);
         if (mmu.is_mapped(arg3, 1)) {
-            size_t copy_size = std::min<size_t>(scratch.size(), 128);
             try {
                 mmu.copy_from_guest(scratch.data(), arg3, copy_size);
             } catch (const EmulatorError&) {
@@ -1169,7 +1292,7 @@ u64 LinuxSyscalls::dispatch(Emulator& emulator, u64 number)
         if (rc < 0)
             return syscall_error(errno);
         try {
-            mmu.copy_to_guest(arg3, scratch.data(), scratch.size());
+            mmu.copy_to_guest(arg3, scratch.data(), copy_size);
         } catch (const EmulatorError&) {
         }
         return static_cast<u64>(rc);
