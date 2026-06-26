@@ -20,6 +20,8 @@ cc -static -O0 -o /tmp/lue-region-dump "$repo_dir/tests/region-dump.c"
 cc -static -O0 -o /tmp/lue-shadow-memory "$repo_dir/tests/shadow-memory.c"
 cc -static -O0 -o /tmp/lue-uninitialized-branch "$repo_dir/tests/uninitialized-branch.c"
 cc -O0 -o /tmp/lue-malloc-tracer "$repo_dir/tests/malloc-tracer.c"
+cc -O0 -o /tmp/lue-malloc-audit "$repo_dir/tests/malloc-audit.c"
+cc -O0 -o /tmp/lue-leak-reachability "$repo_dir/tests/leak-reachability.c"
 cc -O0 -o /tmp/lue-signal-basic "$repo_dir/tests/signal-basic.c"
 cc -O0 -o /tmp/lue-host-signal "$repo_dir/tests/host-signal.c"
 cc -nostdlib -static -o /tmp/lue-fs-tls "$repo_dir/tests/fs-tls.S"
@@ -218,6 +220,9 @@ run_and_check_failure_output_contains region-dump "mmap [mmap]" "$emulator" /tmp
 run_and_check_success_output_contains shadow-memory "uninitialized guest memory read" "$emulator" /tmp/lue-shadow-memory
 run_and_check_success_output_contains uninitialized-branch "conditional branch depends on uninitialized value" "$emulator" /tmp/lue-uninitialized-branch
 run_and_check_malloc_tracer malloc-tracer
+run_and_check_success_output_contains malloc-audit-uninit-read "uninitialized heap read" "$emulator" --malloc-trace /tmp/lue-malloc-audit
+run_and_check_success_output_contains malloc-audit-uaf-read "use-after-free read" "$emulator" --malloc-trace /tmp/lue-malloc-audit
+run_and_check_success_output_contains leak-reachability "1 definitely lost, 1 still reachable" "$emulator" --malloc-trace /tmp/lue-leak-reachability
 run_and_check signal-basic $'before\nhandled\nafter' "$emulator" /tmp/lue-signal-basic
 run_and_check_host_signal host-signal
 run_and_check fs-tls "fs ok" "$emulator" /tmp/lue-fs-tls

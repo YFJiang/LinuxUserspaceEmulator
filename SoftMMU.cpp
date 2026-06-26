@@ -383,13 +383,18 @@ SoftMMU::Region& SoftMMU::region_for(u64 address, int required_prot)
 // aborts the whole guest.
 u8 SoftMMU::read8(u64 address) const
 {
-    return read8_with_shadow(address).value();
+    // Plain reads (instruction fetch, bulk syscall copies) deliberately bypass
+    // the read observer so the MallocTracer audits only real guest data loads.
+    auto const& region = region_for(address, ProtRead);
+    return region.read_offset(address - region.base);
 }
 
 // Read a byte from guest memory while preserving shadow initialization state.
 ValueWithShadow<u8> SoftMMU::read8_with_shadow(u64 address) const
 {
     auto const& region = region_for(address, ProtRead);
+    if (m_read_observer)
+        m_read_observer(address);
     return region.read_offset_with_shadow(address - region.base);
 }
 
@@ -533,6 +538,17 @@ void SoftMMU::mark_initialized(u64 address, size_t size, bool initialized)
 void SoftMMU::set_write_observer(std::function<void(u64)> observer)
 {
     m_write_observer = std::move(observer);
+}
+
+void SoftMMU::set_read_observer(std::function<void(u64)> observer)
+{
+    m_read_observer = std::move(observer);
+}
+
+void SoftMMU::for_each_region(const std::function<void(const Region&)>& callback) const
+{
+    for (auto const& region : m_regions)
+        callback(*region);
 }
 
 // Copy initialized bytes from guest memory into a host buffer.

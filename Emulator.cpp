@@ -134,6 +134,9 @@ Emulator::Emulator(std::string executable_path, std::vector<std::string> argumen
         m_mmu.set_write_observer([this](u64 address) {
             m_malloc_tracer.on_memory_write(address);
         });
+        m_mmu.set_read_observer([this](u64 address) {
+            m_malloc_tracer.on_memory_read(address);
+        });
     }
 }
 
@@ -707,6 +710,12 @@ bool Emulator::is_in_loader_code() const
 {
     auto* image = image_containing(m_cpu.rip());
     return image && image->kind == "loader" && image->contains_code(m_cpu.rip());
+}
+
+bool Emulator::is_in_loader(u64 address) const
+{
+    auto* image = image_containing(address);
+    return image && image->kind == "loader";
 }
 
 bool Emulator::is_in_libc() const

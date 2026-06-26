@@ -115,6 +115,14 @@ public:
     void write64_with_shadow(u64 address, ValueWithShadow<u64> value);
     void mark_initialized(u64 address, size_t size, bool initialized);
     void set_write_observer(std::function<void(u64)> observer);
+    // The read observer fires for guest *data* reads (the shadow-aware path used
+    // by CPU operand reads); plain read8 (instruction fetch, bulk copies) bypasses
+    // it so the MallocTracer only audits real guest loads.
+    void set_read_observer(std::function<void(u64)> observer);
+
+    // Visit every mapped region in address order (used by the leak reachability
+    // scan to walk writable memory for root pointers).
+    void for_each_region(const std::function<void(const Region&)>& callback) const;
 
     void copy_from_guest(void* destination, u64 source, size_t size) const;
     void copy_to_guest(u64 destination, const void* source, size_t size);
@@ -132,6 +140,7 @@ private:
 
     std::vector<std::unique_ptr<Region>> m_regions;
     std::function<void(u64)> m_write_observer;
+    std::function<void(u64)> m_read_observer;
     u64 m_next_allocation { 0x700000000000ULL };
 };
 

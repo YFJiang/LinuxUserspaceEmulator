@@ -52,6 +52,7 @@ public:
     void dump_backtrace(const std::vector<u64>&) const;
 
     bool is_in_loader_code() const;
+    bool is_in_loader(u64 address) const;
     bool is_in_libc() const;
     bool is_in_libc(u64 address) const;
     bool is_in_libsystem() const;

@@ -26,7 +26,9 @@ Currently supported:
 - x87 FPU and SSE/SSE2 floating-point: scalar and packed single/double
   arithmetic, integer<->float conversions, and ordered compares, so glibc's
   `printf` float formatting and real floating-point guest code run
-- basic malloc tracing for leaks, heap overflow writes, and use-after-free writes
+- malloc tracing for heap overflow writes, use-after-free writes and reads,
+  reads of never-initialized heap, and leaks classified by a reachability graph
+  (definitely lost vs. still reachable)
 
 Known limitations:
 
