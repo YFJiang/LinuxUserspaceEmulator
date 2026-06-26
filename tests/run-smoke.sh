@@ -23,6 +23,7 @@ cc -O0 -o /tmp/lue-malloc-tracer "$repo_dir/tests/malloc-tracer.c"
 cc -O0 -o /tmp/lue-signal-basic "$repo_dir/tests/signal-basic.c"
 cc -O0 -o /tmp/lue-host-signal "$repo_dir/tests/host-signal.c"
 cc -nostdlib -static -o /tmp/lue-fs-tls "$repo_dir/tests/fs-tls.S"
+cc -O0 -o /tmp/lue-float "$repo_dir/tests/float-c.c" -lm
 
 emulator="$build_dir/LinuxUserspaceEmulator"
 
@@ -220,3 +221,4 @@ run_and_check_malloc_tracer malloc-tracer
 run_and_check signal-basic $'before\nhandled\nafter' "$emulator" /tmp/lue-signal-basic
 run_and_check_host_signal host-signal
 run_and_check fs-tls "fs ok" "$emulator" /tmp/lue-fs-tls
+run_and_check float $'float: sum=5.0 prod=6.0 root=2.4495 fsum=1.75 ld=7.0\nfloat ok' "$emulator" /tmp/lue-float

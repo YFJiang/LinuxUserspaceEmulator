@@ -23,6 +23,9 @@ Currently supported:
 - byte-level shadow memory plus register/flags taint propagation, with non-fatal
   reports for uninitialized memory reads, uninitialized pointer dereferences, and
   conditional branches that depend on uninitialized data
+- x87 FPU and SSE/SSE2 floating-point: scalar and packed single/double
+  arithmetic, integer<->float conversions, and ordered compares, so glibc's
+  `printf` float formatting and real floating-point guest code run
 - basic malloc tracing for leaks, heap overflow writes, and use-after-free writes
 
 Known limitations:

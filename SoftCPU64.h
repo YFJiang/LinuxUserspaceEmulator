@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "SoftMMU.h"
 
 #include <array>
@@ -155,6 +157,69 @@ private:
     const std::array<u8, 16>& xmm(int index) const { return m_xmm[static_cast<size_t>(index & 15)]; }
     void read_xmm_from_operand(const Operand&, std::array<u8, 16>&, const Prefixes&) const;
     void write_xmm_to_operand(const Operand&, const std::array<u8, 16>&, const Prefixes&);
+
+    void execute_x87(u8 opcode, const Prefixes&);
+    // Scalar/packed SSE floating-point (single and double). The data kind is
+    // selected by the legacy SSE prefix: F3 = scalar single, F2 = scalar double,
+    // 66 = packed double, none = packed single.
+    void execute_sse_float(u8 opcode, const Prefixes&);
+    // Set the integer EFLAGS (ZF/PF/CF, clearing OF/SF/AF) from an ordered
+    // floating-point comparison, shared by (U)COMISS/SD and FCOMI/FUCOMI.
+    void set_eflags_from_float_compare(long double a, long double b);
+
+    // x87 FPU state -----------------------------------------------------------
+    // The x87 stack is 8 entries; each is stored as a host long double (80-bit
+    // on x86 Linux, matching the x87 extended precision format).
+    std::array<long double, 8> m_fpu_st {};
+    // Tag word: 0 = valid, 3 = empty (we use a simple "empty" flag per slot).
+    std::array<bool, 8> m_fpu_empty {};
+    // Top-of-stack index (ST(0) lives at m_fpu_st[m_fpu_top]).
+    int m_fpu_top { 0 };
+    u16 m_fpu_status { 0 };   // FSW
+    u16 m_fpu_control { 0x037f }; // FCW – double-extended, round-nearest, all exceptions masked
+    u8  m_fpu_opcode  { 0 };  // last x87 opcode (low 11 bits)
+
+    // x87 register helpers
+    long double& fst(int i)       { return m_fpu_st[static_cast<size_t>((m_fpu_top + i) & 7)]; }
+    const long double& fst(int i) const { return m_fpu_st[static_cast<size_t>((m_fpu_top + i) & 7)]; }
+    bool& fst_empty(int i)        { return m_fpu_empty[static_cast<size_t>((m_fpu_top + i) & 7)]; }
+    bool  fst_empty(int i) const  { return m_fpu_empty[static_cast<size_t>((m_fpu_top + i) & 7)]; }
+    void fpu_push(long double v) {
+        m_fpu_top = (m_fpu_top - 1) & 7;
+        m_fpu_st[static_cast<size_t>(m_fpu_top)] = v;
+        m_fpu_empty[static_cast<size_t>(m_fpu_top)] = false;
+    }
+    long double fpu_pop() {
+        long double v = m_fpu_st[static_cast<size_t>(m_fpu_top)];
+        m_fpu_empty[static_cast<size_t>(m_fpu_top)] = true;
+        m_fpu_top = (m_fpu_top + 1) & 7;
+        return v;
+    }
+    // Compose the architectural FSW: the cached condition/exception bits plus the
+    // current top-of-stack pointer in bits 11-13.
+    u16 fpu_status_word() const {
+        return static_cast<u16>((m_fpu_status & ~(7u << 11)) | ((static_cast<u16>(m_fpu_top) & 7u) << 11));
+    }
+    void fpu_update_status(long double result) {
+        // Update C1 (rounding indicator) – clear it for now.
+        m_fpu_status &= ~(1u << 9);
+        // Update C3/C2/C0 condition bits for zero/infinity/NaN detection.
+        if (std::isnan(result))     m_fpu_status |=  (1u << 0); // C0 = invalid op indicator
+        else                         m_fpu_status &= ~(1u << 0);
+    }
+    // Update FCOM/FUCOM flags into C3/C2/C0 of FSW.
+    void fpu_compare(long double a, long double b) {
+        m_fpu_status &= ~((1u<<14)|(1u<<10)|(1u<<8)); // clear C3,C2,C0
+        if (std::isnan(a) || std::isnan(b)) {
+            m_fpu_status |= (1u<<14)|(1u<<10)|(1u<<8); // C3=C2=C0=1 (unordered)
+        } else if (a > b) {
+            /* C3=0, C2=0, C0=0 -- greater */
+        } else if (a < b) {
+            m_fpu_status |= (1u<<8); // C0=1 (less)
+        } else {
+            m_fpu_status |= (1u<<14); // C3=1 (equal)
+        }
+    }
 
     [[noreturn]] void unsupported(std::string message) const;
     std::string describe_current_instruction() const;

@@ -4,11 +4,50 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 
 namespace LUE {
 namespace {
+
+// Reinterpret little-endian lanes of an XMM register as host floats/doubles.
+// The host is little-endian x86-64, so a plain memcpy preserves the bit pattern.
+float load_f32(const std::array<u8, 16>& v, int lane)
+{
+    float f;
+    std::memcpy(&f, &v[static_cast<size_t>(lane) * 4], 4);
+    return f;
+}
+
+double load_f64(const std::array<u8, 16>& v, int lane)
+{
+    double d;
+    std::memcpy(&d, &v[static_cast<size_t>(lane) * 8], 8);
+    return d;
+}
+
+void store_f32(std::array<u8, 16>& v, int lane, float f)
+{
+    std::memcpy(&v[static_cast<size_t>(lane) * 4], &f, 4);
+}
+
+void store_f64(std::array<u8, 16>& v, int lane, double d)
+{
+    std::memcpy(&v[static_cast<size_t>(lane) * 8], &d, 8);
+}
+
+i32 load_i32(const std::array<u8, 16>& v, int lane)
+{
+    i32 x;
+    std::memcpy(&x, &v[static_cast<size_t>(lane) * 4], 4);
+    return x;
+}
+
+void store_i32(std::array<u8, 16>& v, int lane, i32 x)
+{
+    std::memcpy(&v[static_cast<size_t>(lane) * 4], &x, 4);
+}
 
 static constexpr u64 CF = 1ULL << 0;
 static constexpr u64 PF = 1ULL << 2;
@@ -1060,6 +1099,29 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         m_gpr_shadow[RAX] = m_gpr_shadow[RBX] = m_gpr_shadow[RCX] = m_gpr_shadow[RDX] = 0;
         break;
     }
+    case 0xba: {
+        // BT/BTS/BTR/BTC r/m, imm8 (group 8): the reg field selects the op and
+        // the bit offset is taken modulo the operand width.
+        auto modrm = fetch_modrm(prefixes);
+        int operation = (modrm.byte >> 3) & 7; // 4=BT 5=BTS 6=BTR 7=BTC
+        auto bit_base = decode_rm_operand(prefixes, modrm);
+        int width = operand_width(prefixes);
+        int bit_index = fetch8() & (width - 1);
+        u64 value = read_operand(bit_base, width, prefixes);
+        set_flag(CF, ((value >> bit_index) & 1) != 0);
+        m_flags_tainted = m_current_taint;
+        u64 bit = static_cast<u64>(1) << bit_index;
+        u64 new_value = value;
+        if (operation == 5)
+            new_value |= bit;
+        else if (operation == 6)
+            new_value &= ~bit;
+        else if (operation == 7)
+            new_value ^= bit;
+        if (operation != 4 && new_value != value)
+            write_operand(bit_base, width, new_value, prefixes);
+        break;
+    }
     case 0xa3:   // BT
     case 0xab:   // BTS
     case 0xb3:   // BTR
@@ -1109,6 +1171,38 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
                 m_mmu.write64(address, new_value);
             }
         }
+        break;
+    }
+    case 0xa4:   // SHLD r/m, reg, imm8
+    case 0xa5:   // SHLD r/m, reg, CL
+    case 0xac:   // SHRD r/m, reg, imm8
+    case 0xad: { // SHRD r/m, reg, CL
+        // Double-precision shifts: bits shifted into r/m come from reg. glibc's
+        // printf float formatting uses these for multi-word arithmetic.
+        auto modrm = fetch_modrm(prefixes);
+        auto dest = decode_rm_operand(prefixes, modrm);
+        int width = operand_width(prefixes);
+        u64 mask = mask_for_width(width);
+        u64 dest_value = read_operand(dest, width, prefixes) & mask;
+        u64 src_value = read_gpr(modrm.reg, width, prefixes) & mask;
+        bool use_imm = (opcode == 0xa4 || opcode == 0xac);
+        int count = (use_imm ? static_cast<int>(fetch8()) : static_cast<int>(read_gpr(RCX, 8, prefixes))) & (width - 1);
+        if (count == 0)
+            break; // no operation; flags unaffected
+        bool is_left = (opcode == 0xa4 || opcode == 0xa5);
+        u64 result;
+        bool cf;
+        if (is_left) {
+            cf = ((dest_value >> (width - count)) & 1) != 0;
+            result = ((dest_value << count) | (src_value >> (width - count))) & mask;
+        } else {
+            cf = ((dest_value >> (count - 1)) & 1) != 0;
+            result = ((dest_value >> count) | (src_value << (width - count))) & mask;
+        }
+        write_operand(dest, width, result, prefixes);
+        set_logic_flags(result, width);
+        set_flag(CF, cf);
+        m_flags_tainted = m_current_taint;
         break;
     }
     case 0xaf: {
@@ -1190,24 +1284,43 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         m_flags_tainted = m_current_taint;
         break;
     }
-    case 0x10:
-    case 0x12:
-    case 0x28:
-    case 0x6f: {
+    case 0x28:   // MOVAPS/MOVAPD xmm, xmm/m128
+    case 0x6f: { // MOVDQA/MOVDQU xmm, xmm/m128
         auto modrm = fetch_modrm(prefixes);
         auto source = decode_rm_operand(prefixes, modrm);
-        if (opcode == 0x12 && prefixes.operand16 && !source.is_register) {
-            auto& destination = xmm(modrm.reg);
-            auto address = effective_address(source);
-            for (int i = 0; i < 8; ++i)
-                destination[static_cast<size_t>(i)] = m_mmu.read8(address + i);
-        } else {
-            std::array<u8, 16> value {};
-            read_xmm_from_operand(source, value, prefixes);
-            xmm(modrm.reg) = value;
-        }
+        std::array<u8, 16> value {};
+        read_xmm_from_operand(source, value, prefixes);
+        xmm(modrm.reg) = value;
         break;
     }
+    case 0x10: // MOVUPS/MOVUPD/MOVSS/MOVSD load
+    case 0x11: // MOVUPS/MOVUPD/MOVSS/MOVSD store
+    case 0x12: // MOVLPS/MOVHLPS/MOVLPD/MOVDDUP
+    case 0x13: // MOVLPS/MOVLPD store
+    case 0x14: // UNPCKLPS/UNPCKLPD
+    case 0x15: // UNPCKHPS/UNPCKHPD
+    case 0x16: // MOVHPS/MOVLHPS/MOVHPD
+    case 0x17: // MOVHPS/MOVHPD store
+    case 0x2a: // CVTSI2SS/CVTSI2SD
+    case 0x2c: // CVTTSS2SI/CVTTSD2SI
+    case 0x2d: // CVTSS2SI/CVTSD2SI
+    case 0x2e: // UCOMISS/UCOMISD
+    case 0x2f: // COMISS/COMISD
+    case 0x51: // SQRTPS/SQRTSS/SQRTSD/SQRTPD
+    case 0x54: // ANDPS/ANDPD
+    case 0x55: // ANDNPS/ANDNPD
+    case 0x56: // ORPS/ORPD
+    case 0x58: // ADDPS/ADDSS/ADDSD/ADDPD
+    case 0x59: // MULPS/MULSS/MULSD/MULPD
+    case 0x5a: // CVTPS2PD/CVTSS2SD/CVTSD2SS/CVTPD2PS
+    case 0x5b: // CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ
+    case 0x5c: // SUBPS/SUBSS/SUBSD/SUBPD
+    case 0x5d: // MINPS/MINSS/MINSD/MINPD
+    case 0x5e: // DIVPS/DIVSS/DIVSD/DIVPD
+    case 0x5f: // MAXPS/MAXSS/MAXSD/MAXPD
+    case 0xe6: // CVTDQ2PD/CVTPD2DQ/CVTTPD2DQ
+        execute_sse_float(opcode, prefixes);
+        break;
     case 0x6e: {
         auto modrm = fetch_modrm(prefixes);
         auto source = decode_rm_operand(prefixes, modrm);
@@ -1330,7 +1443,6 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
         }
         break;
     }
-    case 0x11:
     case 0x29:
     case 0x7f:
     case 0xe7: { // 0xe7 = MOVNTDQ (non-temporal store; same effect here)
@@ -1362,21 +1474,6 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
             for (int i = 0; i < width / 8; ++i)
                 value |= static_cast<u64>(xmm(modrm.reg)[static_cast<size_t>(i)]) << (i * 8);
             write_operand(operand, width, value, prefixes);
-        }
-        break;
-    }
-    case 0x16: {
-        auto modrm = fetch_modrm(prefixes);
-        auto source = decode_rm_operand(prefixes, modrm);
-        auto& destination = xmm(modrm.reg);
-        if (source.is_register) {
-            auto const& rhs = xmm(source.reg);
-            for (int i = 0; i < 8; ++i)
-                destination[static_cast<size_t>(8 + i)] = rhs[static_cast<size_t>(i)];
-        } else {
-            auto address = effective_address(source);
-            for (int i = 0; i < 8; ++i)
-                destination[static_cast<size_t>(8 + i)] = m_mmu.read8(address + i);
         }
         break;
     }
@@ -1509,6 +1606,670 @@ void SoftCPU64::execute_0f(const Prefixes& prefixes)
     }
     default:
         unsupported("unsupported 0F opcode " + hex(opcode, 2));
+    }
+}
+
+void SoftCPU64::set_eflags_from_float_compare(long double a, long double b)
+{
+    // (U)COMIS* and FCOMI write ZF/PF/CF and clear OF/SF/AF. The mapping mirrors
+    // hardware: unordered -> all set, greater -> all clear, less -> CF, equal -> ZF.
+    set_flag(OF, false);
+    set_flag(SF, false);
+    set_flag(AF, false);
+    if (std::isnan(static_cast<double>(a)) || std::isnan(static_cast<double>(b))) {
+        set_flag(ZF, true);
+        set_flag(PF, true);
+        set_flag(CF, true);
+    } else if (a > b) {
+        set_flag(ZF, false);
+        set_flag(PF, false);
+        set_flag(CF, false);
+    } else if (a < b) {
+        set_flag(ZF, false);
+        set_flag(PF, false);
+        set_flag(CF, true);
+    } else {
+        set_flag(ZF, true);
+        set_flag(PF, false);
+        set_flag(CF, false);
+    }
+    // These flags come from concrete float data, so they are not tainted.
+    m_flags_tainted = false;
+}
+
+void SoftCPU64::execute_sse_float(u8 opcode, const Prefixes& prefixes)
+{
+    // The legacy SSE prefix selects the data kind: F3 = scalar single,
+    // F2 = scalar double, 66 = packed double, none = packed single.
+    bool is_scalar = prefixes.repz || prefixes.repnz;
+    bool is_double = prefixes.operand16 || prefixes.repnz;
+    int lanes = is_scalar ? 1 : (is_double ? 2 : 4);
+
+    auto modrm = fetch_modrm(prefixes);
+    auto operand = decode_rm_operand(prefixes, modrm);
+    auto& dst = xmm(modrm.reg);
+
+    // Read the source operand. Scalar forms touch only the low element so we do
+    // not over-read past a 4/8-byte value at the end of a mapping.
+    auto read_source = [&](std::array<u8, 16>& out) {
+        if (operand.is_register) {
+            out = xmm(operand.reg);
+            return;
+        }
+        out.fill(0);
+        auto address = effective_address(operand);
+        int bytes = is_scalar ? (is_double ? 8 : 4) : 16;
+        for (int i = 0; i < bytes; ++i)
+            out[static_cast<size_t>(i)] = m_mmu.read8(address + i);
+    };
+
+    // Load a single scalar (float or double) from the source operand.
+    auto load_scalar = [&](bool dbl) -> long double {
+        if (operand.is_register) {
+            auto const& s = xmm(operand.reg);
+            return dbl ? static_cast<long double>(load_f64(s, 0)) : static_cast<long double>(load_f32(s, 0));
+        }
+        auto address = effective_address(operand);
+        if (dbl) {
+            u64 bits = m_mmu.read64(address);
+            double d;
+            std::memcpy(&d, &bits, 8);
+            return static_cast<long double>(d);
+        }
+        u32 bits = m_mmu.read32(address);
+        float f;
+        std::memcpy(&f, &bits, 4);
+        return static_cast<long double>(f);
+    };
+
+    switch (opcode) {
+    case 0x10: { // MOVUPS/MOVUPD/MOVSS/MOVSD load
+        if (is_scalar) {
+            int bytes = is_double ? 8 : 4;
+            if (operand.is_register) {
+                auto src = xmm(operand.reg);
+                for (int i = 0; i < bytes; ++i)
+                    dst[static_cast<size_t>(i)] = src[static_cast<size_t>(i)];
+            } else {
+                auto address = effective_address(operand);
+                dst.fill(0);
+                for (int i = 0; i < bytes; ++i)
+                    dst[static_cast<size_t>(i)] = m_mmu.read8(address + i);
+            }
+        } else {
+            std::array<u8, 16> value {};
+            read_xmm_from_operand(operand, value, prefixes);
+            dst = value;
+        }
+        return;
+    }
+    case 0x11: { // MOVUPS/MOVUPD/MOVSS/MOVSD store
+        if (is_scalar) {
+            int bytes = is_double ? 8 : 4;
+            if (operand.is_register) {
+                auto& d = xmm(operand.reg);
+                for (int i = 0; i < bytes; ++i)
+                    d[static_cast<size_t>(i)] = dst[static_cast<size_t>(i)];
+            } else {
+                auto address = effective_address(operand);
+                for (int i = 0; i < bytes; ++i)
+                    m_mmu.write8(address + i, dst[static_cast<size_t>(i)]);
+            }
+        } else {
+            write_xmm_to_operand(operand, dst, prefixes);
+        }
+        return;
+    }
+    case 0x12: { // MOVLPS / MOVHLPS / MOVLPD / MOVDDUP
+        if (prefixes.repnz) {
+            // MOVDDUP: duplicate the low 8 bytes into both halves.
+            std::array<u8, 16> src {};
+            if (operand.is_register) {
+                src = xmm(operand.reg);
+            } else {
+                auto address = effective_address(operand);
+                for (int i = 0; i < 8; ++i)
+                    src[static_cast<size_t>(i)] = m_mmu.read8(address + i);
+            }
+            for (int i = 0; i < 8; ++i) {
+                dst[static_cast<size_t>(i)] = src[static_cast<size_t>(i)];
+                dst[static_cast<size_t>(8 + i)] = src[static_cast<size_t>(i)];
+            }
+        } else if (operand.is_register) {
+            // MOVHLPS: low 8 bytes of dst <- high 8 bytes of source.
+            auto src = xmm(operand.reg);
+            for (int i = 0; i < 8; ++i)
+                dst[static_cast<size_t>(i)] = src[static_cast<size_t>(8 + i)];
+        } else {
+            // MOVLPS/MOVLPD: low 8 bytes <- memory, high 8 bytes preserved.
+            auto address = effective_address(operand);
+            for (int i = 0; i < 8; ++i)
+                dst[static_cast<size_t>(i)] = m_mmu.read8(address + i);
+        }
+        return;
+    }
+    case 0x13: { // MOVLPS/MOVLPD store: m64 <- low 8 bytes
+        auto address = effective_address(operand);
+        for (int i = 0; i < 8; ++i)
+            m_mmu.write8(address + i, dst[static_cast<size_t>(i)]);
+        return;
+    }
+    case 0x14:   // UNPCKLPS/UNPCKLPD: interleave low elements
+    case 0x15: { // UNPCKHPS/UNPCKHPD: interleave high elements
+        std::array<u8, 16> src {};
+        read_xmm_from_operand(operand, src, prefixes);
+        auto a = dst;
+        int element = is_double ? 8 : 4;
+        int pairs = 16 / (element * 2);
+        int base = opcode == 0x15 ? 8 : 0;
+        for (int p = 0; p < pairs; ++p) {
+            int src_off = base + p * element;
+            int dst_off = p * element * 2;
+            for (int b = 0; b < element; ++b) {
+                dst[static_cast<size_t>(dst_off + b)] = a[static_cast<size_t>(src_off + b)];
+                dst[static_cast<size_t>(dst_off + element + b)] = src[static_cast<size_t>(src_off + b)];
+            }
+        }
+        return;
+    }
+    case 0x16: { // MOVHPS / MOVLHPS / MOVHPD
+        if (operand.is_register) {
+            // MOVLHPS: high 8 bytes of dst <- low 8 bytes of source.
+            auto src = xmm(operand.reg);
+            for (int i = 0; i < 8; ++i)
+                dst[static_cast<size_t>(8 + i)] = src[static_cast<size_t>(i)];
+        } else {
+            // MOVHPS/MOVHPD: high 8 bytes <- memory.
+            auto address = effective_address(operand);
+            for (int i = 0; i < 8; ++i)
+                dst[static_cast<size_t>(8 + i)] = m_mmu.read8(address + i);
+        }
+        return;
+    }
+    case 0x17: { // MOVHPS/MOVHPD store: m64 <- high 8 bytes
+        auto address = effective_address(operand);
+        for (int i = 0; i < 8; ++i)
+            m_mmu.write8(address + i, dst[static_cast<size_t>(8 + i)]);
+        return;
+    }
+    case 0x2a: { // CVTSI2SS / CVTSI2SD: integer r/m -> scalar float, lane 0.
+        int width = prefixes.rex_w() ? 64 : 32;
+        i64 value = static_cast<i64>(sign_extend(read_operand(operand, width, prefixes), width));
+        if (prefixes.repnz)
+            store_f64(dst, 0, static_cast<double>(value));
+        else
+            store_f32(dst, 0, static_cast<float>(value));
+        return;
+    }
+    case 0x2c:   // CVTTSS2SI / CVTTSD2SI (truncate)
+    case 0x2d: { // CVTSS2SI  / CVTSD2SI  (round)
+        int width = prefixes.rex_w() ? 64 : 32;
+        long double v = load_scalar(prefixes.repnz);
+        i64 result = opcode == 0x2c ? static_cast<i64>(v) : static_cast<i64>(std::llrint(v));
+        write_gpr(modrm.reg, width, static_cast<u64>(result), prefixes);
+        return;
+    }
+    case 0x2e:   // UCOMISS / UCOMISD
+    case 0x2f: { // COMISS  / COMISD
+        bool dbl = prefixes.operand16;
+        long double a = dbl ? static_cast<long double>(load_f64(dst, 0)) : static_cast<long double>(load_f32(dst, 0));
+        long double b = load_scalar(dbl);
+        set_eflags_from_float_compare(a, b);
+        return;
+    }
+    case 0x54:   // ANDPS / ANDPD
+    case 0x55:   // ANDNPS / ANDNPD
+    case 0x56: { // ORPS / ORPD
+        std::array<u8, 16> src {};
+        read_xmm_from_operand(operand, src, prefixes);
+        for (size_t i = 0; i < 16; ++i) {
+            if (opcode == 0x54)
+                dst[i] = static_cast<u8>(dst[i] & src[i]);
+            else if (opcode == 0x55)
+                dst[i] = static_cast<u8>(~dst[i] & src[i]);
+            else
+                dst[i] = static_cast<u8>(dst[i] | src[i]);
+        }
+        return;
+    }
+    case 0x51:   // SQRT
+    case 0x58:   // ADD
+    case 0x59:   // MUL
+    case 0x5c:   // SUB
+    case 0x5d:   // MIN
+    case 0x5e:   // DIV
+    case 0x5f: { // MAX
+        std::array<u8, 16> src {};
+        read_source(src);
+        for (int lane = 0; lane < lanes; ++lane) {
+            if (is_double) {
+                double a = load_f64(dst, lane);
+                double b = load_f64(src, lane);
+                double r = 0;
+                switch (opcode) {
+                case 0x51: r = std::sqrt(b); break;
+                case 0x58: r = a + b; break;
+                case 0x59: r = a * b; break;
+                case 0x5c: r = a - b; break;
+                case 0x5d: r = (a < b) ? a : b; break;
+                case 0x5e: r = a / b; break;
+                case 0x5f: r = (a > b) ? a : b; break;
+                }
+                store_f64(dst, lane, r);
+            } else {
+                float a = load_f32(dst, lane);
+                float b = load_f32(src, lane);
+                float r = 0;
+                switch (opcode) {
+                case 0x51: r = std::sqrt(b); break;
+                case 0x58: r = a + b; break;
+                case 0x59: r = a * b; break;
+                case 0x5c: r = a - b; break;
+                case 0x5d: r = (a < b) ? a : b; break;
+                case 0x5e: r = a / b; break;
+                case 0x5f: r = (a > b) ? a : b; break;
+                }
+                store_f32(dst, lane, r);
+            }
+        }
+        return;
+    }
+    case 0x5a: { // CVTSS2SD / CVTSD2SS / CVTPS2PD / CVTPD2PS
+        if (prefixes.repz) { // CVTSS2SD
+            store_f64(dst, 0, static_cast<double>(load_scalar(false)));
+        } else if (prefixes.repnz) { // CVTSD2SS
+            store_f32(dst, 0, static_cast<float>(load_scalar(true)));
+        } else if (prefixes.operand16) { // CVTPD2PS
+            std::array<u8, 16> src {};
+            read_xmm_from_operand(operand, src, prefixes);
+            float a = static_cast<float>(load_f64(src, 0));
+            float b = static_cast<float>(load_f64(src, 1));
+            dst.fill(0);
+            store_f32(dst, 0, a);
+            store_f32(dst, 1, b);
+        } else { // CVTPS2PD
+            std::array<u8, 16> src {};
+            read_xmm_from_operand(operand, src, prefixes);
+            double a = static_cast<double>(load_f32(src, 0));
+            double b = static_cast<double>(load_f32(src, 1));
+            store_f64(dst, 0, a);
+            store_f64(dst, 1, b);
+        }
+        return;
+    }
+    case 0x5b: { // CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ
+        std::array<u8, 16> src {};
+        read_xmm_from_operand(operand, src, prefixes);
+        if (!prefixes.operand16 && !prefixes.repz) { // CVTDQ2PS
+            for (int lane = 0; lane < 4; ++lane)
+                store_f32(dst, lane, static_cast<float>(load_i32(src, lane)));
+        } else { // CVTPS2DQ (66) / CVTTPS2DQ (F3)
+            bool truncate = prefixes.repz;
+            for (int lane = 0; lane < 4; ++lane) {
+                float f = load_f32(src, lane);
+                i32 r = truncate ? static_cast<i32>(f) : static_cast<i32>(std::lrintf(f));
+                store_i32(dst, lane, r);
+            }
+        }
+        return;
+    }
+    case 0xe6: { // CVTDQ2PD / CVTPD2DQ / CVTTPD2DQ
+        std::array<u8, 16> src {};
+        read_xmm_from_operand(operand, src, prefixes);
+        if (prefixes.repz) { // CVTDQ2PD
+            store_f64(dst, 0, static_cast<double>(load_i32(src, 0)));
+            store_f64(dst, 1, static_cast<double>(load_i32(src, 1)));
+        } else { // CVTPD2DQ (F2) / CVTTPD2DQ (66)
+            bool truncate = prefixes.operand16;
+            double a = load_f64(src, 0);
+            double b = load_f64(src, 1);
+            dst.fill(0);
+            store_i32(dst, 0, truncate ? static_cast<i32>(a) : static_cast<i32>(std::lrint(a)));
+            store_i32(dst, 1, truncate ? static_cast<i32>(b) : static_cast<i32>(std::lrint(b)));
+        }
+        return;
+    }
+    default:
+        unsupported("unsupported SSE float opcode 0F " + hex(opcode, 2));
+    }
+}
+
+void SoftCPU64::execute_x87(u8 opcode, const Prefixes& prefixes)
+{
+    auto modrm = fetch_modrm(prefixes);
+    int reg_field = (modrm.byte >> 3) & 7; // operation selector for memory forms
+    int sti = modrm.byte & 7;              // ST(i) index for register forms
+
+    // Memory float/integer access helpers. The host long double is the 80-bit
+    // x87 format in its low 10 bytes, so m80 transfers move exactly 10 bytes.
+    auto read_m32 = [&](u64 a) -> long double {
+        u32 bits = m_mmu.read32(a);
+        float f;
+        std::memcpy(&f, &bits, 4);
+        return static_cast<long double>(f);
+    };
+    auto read_m64 = [&](u64 a) -> long double {
+        u64 bits = m_mmu.read64(a);
+        double d;
+        std::memcpy(&d, &bits, 8);
+        return static_cast<long double>(d);
+    };
+    auto read_m80 = [&](u64 a) -> long double {
+        u8 bytes[sizeof(long double)] = {};
+        for (int k = 0; k < 10; ++k)
+            bytes[k] = m_mmu.read8(a + k);
+        long double v = 0.0L;
+        std::memcpy(&v, bytes, 10);
+        return v;
+    };
+    auto write_m32 = [&](u64 a, long double v) {
+        float f = static_cast<float>(v);
+        u32 bits;
+        std::memcpy(&bits, &f, 4);
+        m_mmu.write32(a, bits);
+    };
+    auto write_m64 = [&](u64 a, long double v) {
+        double d = static_cast<double>(v);
+        u64 bits;
+        std::memcpy(&bits, &d, 8);
+        m_mmu.write64(a, bits);
+    };
+    auto write_m80 = [&](u64 a, long double v) {
+        u8 bytes[sizeof(long double)] = {};
+        std::memcpy(bytes, &v, sizeof(long double));
+        for (int k = 0; k < 10; ++k)
+            m_mmu.write8(a + k, bytes[k]);
+    };
+    auto store_int = [&](u64 a, long double v, int bits, bool truncate) {
+        i64 r = truncate ? static_cast<i64>(v) : static_cast<i64>(std::llrint(v));
+        if (bits == 16)
+            m_mmu.write16(a, static_cast<u16>(static_cast<i16>(r)));
+        else if (bits == 32)
+            m_mmu.write32(a, static_cast<u32>(static_cast<i32>(r)));
+        else
+            m_mmu.write64(a, static_cast<u64>(r));
+    };
+    // Apply ST(0) = ST(0) <op> b for the eight memory/integer arithmetic forms.
+    auto arith_into_st0 = [&](long double b) {
+        long double& st0 = fst(0);
+        switch (reg_field) {
+        case 0: st0 = st0 + b; break;                  // FADD
+        case 1: st0 = st0 * b; break;                  // FMUL
+        case 2: fpu_compare(st0, b); break;            // FCOM
+        case 3: fpu_compare(st0, b); fpu_pop(); break; // FCOMP
+        case 4: st0 = st0 - b; break;                  // FSUB
+        case 5: st0 = b - st0; break;                  // FSUBR
+        case 6: st0 = st0 / b; break;                  // FDIV
+        case 7: st0 = b / st0; break;                  // FDIVR
+        }
+    };
+
+    if (!modrm.is_register()) {
+        auto operand = decode_rm_operand(prefixes, modrm);
+        u64 address = effective_address(operand);
+        switch (opcode) {
+        case 0xd8: // arithmetic with m32fp
+            arith_into_st0(read_m32(address));
+            break;
+        case 0xdc: // arithmetic with m64fp
+            arith_into_st0(read_m64(address));
+            break;
+        case 0xda: // arithmetic with m32int
+            arith_into_st0(static_cast<long double>(static_cast<i32>(m_mmu.read32(address))));
+            break;
+        case 0xde: // arithmetic with m16int
+            arith_into_st0(static_cast<long double>(static_cast<i16>(m_mmu.read16(address))));
+            break;
+        case 0xd9: // FLD/FST/FSTP m32fp, FLDCW/FNSTCW
+            switch (reg_field) {
+            case 0: fpu_push(read_m32(address)); break;
+            case 2: write_m32(address, fst(0)); break;
+            case 3: write_m32(address, fst(0)); fpu_pop(); break;
+            case 5: m_fpu_control = m_mmu.read16(address); break;
+            case 7: m_mmu.write16(address, m_fpu_control); break;
+            default: unsupported("unsupported x87 D9 /" + std::to_string(reg_field));
+            }
+            break;
+        case 0xdd: // FLD/FST/FSTP m64fp, FNSTSW m16
+            switch (reg_field) {
+            case 0: fpu_push(read_m64(address)); break;
+            case 2: write_m64(address, fst(0)); break;
+            case 3: write_m64(address, fst(0)); fpu_pop(); break;
+            case 7: m_mmu.write16(address, fpu_status_word()); break;
+            default: unsupported("unsupported x87 DD /" + std::to_string(reg_field));
+            }
+            break;
+        case 0xdb: // FILD/FIST(TP)/FISTP m32int, FLD/FSTP m80fp
+            switch (reg_field) {
+            case 0: fpu_push(static_cast<long double>(static_cast<i32>(m_mmu.read32(address)))); break;
+            case 1: store_int(address, fst(0), 32, true); fpu_pop(); break;
+            case 2: store_int(address, fst(0), 32, false); break;
+            case 3: store_int(address, fst(0), 32, false); fpu_pop(); break;
+            case 5: fpu_push(read_m80(address)); break;
+            case 7: write_m80(address, fst(0)); fpu_pop(); break;
+            default: unsupported("unsupported x87 DB /" + std::to_string(reg_field));
+            }
+            break;
+        case 0xdf: // FILD/FIST(TP)/FISTP m16int, FILD/FISTP m64int
+            switch (reg_field) {
+            case 0: fpu_push(static_cast<long double>(static_cast<i16>(m_mmu.read16(address)))); break;
+            case 1: store_int(address, fst(0), 16, true); fpu_pop(); break;
+            case 2: store_int(address, fst(0), 16, false); break;
+            case 3: store_int(address, fst(0), 16, false); fpu_pop(); break;
+            case 5: fpu_push(static_cast<long double>(static_cast<i64>(m_mmu.read64(address)))); break;
+            case 7: store_int(address, fst(0), 64, false); fpu_pop(); break;
+            default: unsupported("unsupported x87 DF /" + std::to_string(reg_field));
+            }
+            break;
+        default:
+            unsupported("unsupported x87 memory opcode " + hex(opcode, 2));
+        }
+        return;
+    }
+
+    // Register-form encodings: the full second byte (0xC0-0xFF) selects the op.
+    u8 rb = modrm.byte;
+    int sub = (rb >> 3) & 7;
+    switch (opcode) {
+    case 0xd8: { // FADD/FMUL/FCOM/FCOMP/FSUB/FSUBR/FDIV/FDIVR ST(0),ST(i)
+        long double b = fst(sti);
+        long double& st0 = fst(0);
+        switch (sub) {
+        case 0: st0 = st0 + b; break;
+        case 1: st0 = st0 * b; break;
+        case 2: fpu_compare(st0, b); break;
+        case 3: fpu_compare(st0, b); fpu_pop(); break;
+        case 4: st0 = st0 - b; break;
+        case 5: st0 = b - st0; break;
+        case 6: st0 = st0 / b; break;
+        case 7: st0 = b / st0; break;
+        }
+        break;
+    }
+    case 0xdc: { // arithmetic with destination ST(i): ST(i) <op> ST(0)
+        long double a = fst(0);
+        long double& d = fst(sti);
+        switch (sub) {
+        case 0: d = d + a; break;   // FADD
+        case 1: d = d * a; break;   // FMUL
+        case 4: d = a - d; break;   // FSUBR ST(i)
+        case 5: d = d - a; break;   // FSUB  ST(i)
+        case 6: d = a / d; break;   // FDIVR ST(i)
+        case 7: d = d / a; break;   // FDIV  ST(i)
+        default: unsupported("unsupported x87 DC register op " + hex(rb, 2));
+        }
+        break;
+    }
+    case 0xde: { // arithmetic-and-pop, plus FCOMPP
+        if (rb == 0xd9) { // FCOMPP
+            fpu_compare(fst(0), fst(1));
+            fpu_pop();
+            fpu_pop();
+            break;
+        }
+        long double a = fst(0);
+        long double& d = fst(sti);
+        switch (sub) {
+        case 0: d = d + a; break;   // FADDP
+        case 1: d = d * a; break;   // FMULP
+        case 4: d = a - d; break;   // FSUBRP
+        case 5: d = d - a; break;   // FSUBP
+        case 6: d = a / d; break;   // FDIVRP
+        case 7: d = d / a; break;   // FDIVP
+        default: unsupported("unsupported x87 DE register op " + hex(rb, 2));
+        }
+        fpu_pop();
+        break;
+    }
+    case 0xd9: { // loads, constants, and unary transcendental/arithmetic ops
+        if (rb >= 0xc0 && rb <= 0xc7) { // FLD ST(i)
+            fpu_push(fst(sti));
+        } else if (rb >= 0xc8 && rb <= 0xcf) { // FXCH ST(i)
+            std::swap(fst(0), fst(sti));
+        } else {
+            switch (rb) {
+            case 0xd0: break;                              // FNOP
+            case 0xe0: fst(0) = -fst(0); break;            // FCHS
+            case 0xe1: fst(0) = std::fabs(fst(0)); break;  // FABS
+            case 0xe4: fpu_compare(fst(0), 0.0L); break;   // FTST
+            case 0xe5: {                                   // FXAM
+                long double v = fst(0);
+                m_fpu_status &= ~((1u << 14) | (1u << 10) | (1u << 9) | (1u << 8));
+                if (std::signbit(static_cast<double>(v)))
+                    m_fpu_status |= (1u << 9); // C1 = sign
+                if (fst_empty(0))
+                    m_fpu_status |= (1u << 14) | (1u << 8);     // empty: C3=C0=1
+                else if (std::isnan(static_cast<double>(v)))
+                    m_fpu_status |= (1u << 8);                   // NaN: C0=1
+                else if (std::isinf(static_cast<double>(v)))
+                    m_fpu_status |= (1u << 10) | (1u << 8);      // Inf: C2=C0=1
+                else if (v == 0.0L)
+                    m_fpu_status |= (1u << 14);                  // zero: C3=1
+                else
+                    m_fpu_status |= (1u << 10);                  // normal: C2=1
+                break;
+            }
+            case 0xe8: fpu_push(1.0L); break;                          // FLD1
+            case 0xe9: fpu_push(std::log2(10.0L)); break;             // FLDL2T
+            case 0xea: fpu_push(std::log2(2.718281828459045235360287L)); break; // FLDL2E
+            case 0xeb: fpu_push(3.141592653589793238462643L); break;  // FLDPI
+            case 0xec: fpu_push(std::log10(2.0L)); break;            // FLDLG2
+            case 0xed: fpu_push(std::log(2.0L)); break;               // FLDLN2
+            case 0xee: fpu_push(0.0L); break;                         // FLDZ
+            case 0xf0: fst(0) = std::exp2(fst(0)) - 1.0L; break;     // F2XM1
+            case 0xf1: fst(1) = fst(1) * std::log2(fst(0)); fpu_pop(); break; // FYL2X
+            case 0xf2: { long double t = std::tan(fst(0)); fst(0) = t; fpu_push(1.0L); break; } // FPTAN
+            case 0xf3: fst(1) = std::atan2(fst(1), fst(0)); fpu_pop(); break;  // FPATAN
+            case 0xf4: {                                              // FXTRACT
+                long double val = fst(0);
+                int exp = 0;
+                long double mant = std::frexp(val, &exp); // val = mant * 2^exp, 0.5<=|mant|<1
+                fst(0) = static_cast<long double>(exp - 1);
+                fpu_push(mant * 2.0L);
+                break;
+            }
+            case 0xf5: fst(0) = std::remainder(fst(0), fst(1)); break; // FPREM1
+            case 0xf6: m_fpu_top = (m_fpu_top + 1) & 7; break;         // FDECSTP (top decreases visible depth)
+            case 0xf7: m_fpu_top = (m_fpu_top - 1) & 7; break;         // FINCSTP
+            case 0xf8: fst(0) = std::fmod(fst(0), fst(1)); break;      // FPREM
+            case 0xf9: fst(1) = fst(1) * std::log2(fst(0) + 1.0L); fpu_pop(); break; // FYL2XP1
+            case 0xfa: fst(0) = std::sqrt(fst(0)); break;             // FSQRT
+            case 0xfb: { long double s = std::sin(fst(0)); long double c = std::cos(fst(0)); fst(0) = s; fpu_push(c); break; } // FSINCOS
+            case 0xfc: fst(0) = std::rint(fst(0)); break;             // FRNDINT
+            case 0xfd: fst(0) = std::ldexp(fst(0), static_cast<int>(fst(1))); break; // FSCALE
+            case 0xfe: fst(0) = std::sin(fst(0)); break;              // FSIN
+            case 0xff: fst(0) = std::cos(fst(0)); break;              // FCOS
+            default: unsupported("unsupported x87 D9 register op " + hex(rb, 2));
+            }
+        }
+        break;
+    }
+    case 0xda: { // FCMOVB/E/BE/U and FUCOMPP
+        if (rb == 0xe9) { // FUCOMPP
+            fpu_compare(fst(0), fst(1));
+            fpu_pop();
+            fpu_pop();
+            break;
+        }
+        bool take = false;
+        if (rb >= 0xc0 && rb <= 0xc7)
+            take = flag(CF);                       // FCMOVB
+        else if (rb >= 0xc8 && rb <= 0xcf)
+            take = flag(ZF);                       // FCMOVE
+        else if (rb >= 0xd0 && rb <= 0xd7)
+            take = flag(CF) || flag(ZF);           // FCMOVBE
+        else if (rb >= 0xd8 && rb <= 0xdf)
+            take = flag(PF);                       // FCMOVU
+        else
+            unsupported("unsupported x87 DA register op " + hex(rb, 2));
+        if (take)
+            fst(0) = fst(sti);
+        break;
+    }
+    case 0xdb: { // FCMOVN*, FNCLEX/FNINIT, FUCOMI/FCOMI
+        if (rb == 0xe2) { // FNCLEX: clear exception/status bits, keep condition codes
+            m_fpu_status &= ~0x80ffu;
+        } else if (rb == 0xe3) { // FNINIT
+            m_fpu_control = 0x037f;
+            m_fpu_status = 0;
+            m_fpu_top = 0;
+            m_fpu_empty.fill(true);
+        } else if (rb >= 0xe8 && rb <= 0xef) { // FUCOMI ST(0),ST(i)
+            set_eflags_from_float_compare(fst(0), fst(sti));
+        } else if (rb >= 0xf0 && rb <= 0xf7) { // FCOMI ST(0),ST(i)
+            set_eflags_from_float_compare(fst(0), fst(sti));
+        } else {
+            bool take = false;
+            if (rb >= 0xc0 && rb <= 0xc7)
+                take = !flag(CF);                  // FCMOVNB
+            else if (rb >= 0xc8 && rb <= 0xcf)
+                take = !flag(ZF);                  // FCMOVNE
+            else if (rb >= 0xd0 && rb <= 0xd7)
+                take = !(flag(CF) || flag(ZF));    // FCMOVNBE
+            else if (rb >= 0xd8 && rb <= 0xdf)
+                take = !flag(PF);                  // FCMOVNU
+            else
+                unsupported("unsupported x87 DB register op " + hex(rb, 2));
+            if (take)
+                fst(0) = fst(sti);
+        }
+        break;
+    }
+    case 0xdd: { // FFREE, FST/FSTP ST(i), FUCOM/FUCOMP ST(i)
+        if (rb >= 0xc0 && rb <= 0xc7) { // FFREE ST(i)
+            fst_empty(sti) = true;
+        } else if (rb >= 0xd0 && rb <= 0xd7) { // FST ST(i)
+            fst(sti) = fst(0);
+        } else if (rb >= 0xd8 && rb <= 0xdf) { // FSTP ST(i)
+            fst(sti) = fst(0);
+            fpu_pop();
+        } else if (rb >= 0xe0 && rb <= 0xe7) { // FUCOM ST(i)
+            fpu_compare(fst(0), fst(sti));
+        } else if (rb >= 0xe8 && rb <= 0xef) { // FUCOMP ST(i)
+            fpu_compare(fst(0), fst(sti));
+            fpu_pop();
+        } else {
+            unsupported("unsupported x87 DD register op " + hex(rb, 2));
+        }
+        break;
+    }
+    case 0xdf: { // FNSTSW AX, FUCOMIP/FCOMIP
+        if (rb == 0xe0) { // FNSTSW AX
+            m_gpr[RAX] = (m_gpr[RAX] & ~0xffffULL) | fpu_status_word();
+            m_gpr_shadow[RAX] &= ~0xffffULL;
+        } else if (rb >= 0xe8 && rb <= 0xef) { // FUCOMIP ST(0),ST(i)
+            set_eflags_from_float_compare(fst(0), fst(sti));
+            fpu_pop();
+        } else if (rb >= 0xf0 && rb <= 0xf7) { // FCOMIP ST(0),ST(i)
+            set_eflags_from_float_compare(fst(0), fst(sti));
+            fpu_pop();
+        } else {
+            unsupported("unsupported x87 DF register op " + hex(rb, 2));
+        }
+        break;
+    }
+    default:
+        unsupported("unsupported x87 register opcode " + hex(opcode, 2));
     }
 }
 
@@ -1856,6 +2617,16 @@ void SoftCPU64::step()
         m_decode_pc = m_decode_pc + rel;
         break;
     }
+    case 0xd8:
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
+    case 0xdc:
+    case 0xdd:
+    case 0xde:
+    case 0xdf:
+        execute_x87(opcode, prefixes);
+        break;
     case 0xf6:
     case 0xf7:
         execute_group_f6_f7(opcode, prefixes);
@@ -2205,7 +2976,27 @@ std::string SoftCPU64::describe_current_instruction() const
             out << name << " " << rm_text(modrm, operand_width()) << ", " << reg_text(modrm.reg, operand_width());
             return with_prefixes(out.str());
         }
-        if (op2 == 0x10 || op2 == 0x11 || op2 == 0x12 || op2 == 0x16 || op2 == 0x28 || op2 == 0x29 || op2 == 0x57 || op2 == 0x6e || op2 == 0x6f || op2 == 0x7e || op2 == 0x7f || op2 == 0xd6 || op2 == 0xd7 || op2 == 0xef || op2 == 0xdb || op2 == 0xdf || op2 == 0xeb || op2 == 0xd4 || op2 == 0xf8 || op2 == 0xf9 || op2 == 0xfa || op2 == 0x60 || op2 == 0x61 || op2 == 0x62 || op2 == 0x6c || op2 == 0x70 || op2 == 0x73 || op2 == 0x74 || op2 == 0x75 || op2 == 0x76 || op2 == 0xc6) {
+        if (op2 == 0xa4 || op2 == 0xa5 || op2 == 0xac || op2 == 0xad) {
+            auto modrm = read_modrm();
+            bool has_imm = (op2 == 0xa4 || op2 == 0xac);
+            auto operand = rm_text(modrm, operand_width(), has_imm ? 1 : 0);
+            const char* name = (op2 == 0xa4 || op2 == 0xa5) ? "shld" : "shrd";
+            out << name << " ";
+            if (has_imm)
+                out << imm_text(cursor.read8()) << ", ";
+            else
+                out << "%cl, ";
+            out << reg_text(modrm.reg, operand_width()) << ", " << operand;
+            return with_prefixes(out.str());
+        }
+        if (op2 == 0xba) {
+            auto modrm = read_modrm();
+            auto operand = rm_text(modrm, operand_width(), 1);
+            static constexpr const char* ops[] = { "bt?", "bt?", "bt?", "bt?", "bt", "bts", "btr", "btc" };
+            out << ops[(modrm.byte >> 3) & 7] << " " << imm_text(cursor.read8()) << ", " << operand;
+            return with_prefixes(out.str());
+        }
+        if (op2 == 0x10 || op2 == 0x11 || op2 == 0x12 || op2 == 0x13 || op2 == 0x14 || op2 == 0x15 || op2 == 0x16 || op2 == 0x17 || op2 == 0x28 || op2 == 0x29 || op2 == 0x2a || op2 == 0x2c || op2 == 0x2d || op2 == 0x2e || op2 == 0x2f || op2 == 0x51 || op2 == 0x54 || op2 == 0x55 || op2 == 0x56 || op2 == 0x57 || op2 == 0x58 || op2 == 0x59 || op2 == 0x5a || op2 == 0x5b || op2 == 0x5c || op2 == 0x5d || op2 == 0x5e || op2 == 0x5f || op2 == 0x6e || op2 == 0x6f || op2 == 0x7e || op2 == 0x7f || op2 == 0xd6 || op2 == 0xd7 || op2 == 0xe6 || op2 == 0xef || op2 == 0xdb || op2 == 0xdf || op2 == 0xeb || op2 == 0xd4 || op2 == 0xf8 || op2 == 0xf9 || op2 == 0xfa || op2 == 0x60 || op2 == 0x61 || op2 == 0x62 || op2 == 0x6c || op2 == 0x70 || op2 == 0x73 || op2 == 0x74 || op2 == 0x75 || op2 == 0x76 || op2 == 0xc6) {
             auto modrm = read_modrm();
             int trailing_bytes = (op2 == 0x70 || op2 == 0x73 || op2 == 0xc6) ? 1 : 0;
             auto operand = rm_text(modrm, 128, trailing_bytes);
@@ -2228,6 +3019,28 @@ std::string SoftCPU64::describe_current_instruction() const
                 name = "psub";
             else if (op2 == 0xc6)
                 name = "shufpd";
+            else if (op2 == 0x58)
+                name = "add[ps]";
+            else if (op2 == 0x59)
+                name = "mul[ps]";
+            else if (op2 == 0x5c)
+                name = "sub[ps]";
+            else if (op2 == 0x5e)
+                name = "div[ps]";
+            else if (op2 == 0x51)
+                name = "sqrt[ps]";
+            else if (op2 == 0x5d)
+                name = "min[ps]";
+            else if (op2 == 0x5f)
+                name = "max[ps]";
+            else if (op2 == 0x54 || op2 == 0x55 || op2 == 0x56)
+                name = "andorps";
+            else if (op2 == 0x2a || op2 == 0x2c || op2 == 0x2d || op2 == 0x5a || op2 == 0x5b || op2 == 0xe6)
+                name = "cvt";
+            else if (op2 == 0x2e || op2 == 0x2f)
+                name = "comis";
+            else if (op2 == 0x14 || op2 == 0x15)
+                name = "unpckps";
             out << name << " " << operand << ", %xmm" << modrm.reg;
             return with_prefixes(out.str());
         }
@@ -2387,6 +3200,24 @@ std::string SoftCPU64::describe_current_instruction() const
         int operation = (modrm.byte >> 3) & 7;
         int trailing_bytes = operation <= 1 ? (opcode == 0xf6 ? 1 : (operand_width() == 16 ? 2 : 4)) : 0;
         out << ops[operation] << " " << rm_text(modrm, opcode == 0xf6 ? 8 : operand_width(), trailing_bytes);
+        return with_prefixes(out.str());
+    }
+    case 0xd8:
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
+    case 0xdc:
+    case 0xdd:
+    case 0xde:
+    case 0xdf: {
+        // x87: print a generic mnemonic but consume the ModRM (and any memory
+        // operand bytes) so the traced instruction length stays correct.
+        auto modrm = read_modrm();
+        out << "x87." << hex(opcode, 2);
+        if (modrm.mod != 3)
+            out << " " << memory_text(modrm);
+        else
+            out << " /" << hex(modrm.byte, 2);
         return with_prefixes(out.str());
     }
     case 0xfc:
